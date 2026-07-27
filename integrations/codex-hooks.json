@@ -1,0 +1,49 @@
+{
+  "description": "Drive the local G915 Codex task-status indicator.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.local/bin/codex-agent-indicator hook",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.local/bin/codex-agent-indicator hook",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.local/bin/codex-agent-indicator hook",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__HOME__/.local/bin/codex-agent-indicator hook",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

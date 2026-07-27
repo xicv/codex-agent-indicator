@@ -1,0 +1,48 @@
+# Logitech G915 wired USB interface. Integer values may use TOML hex notation.
+[device]
+vendor_id = 0x046d
+product_id = 0xc33e
+usage_page = 0xff00
+usage = 2
+device_index = 0xff
+lighting_software_id = 0x0f
+init_software_id = 0x0e
+per_key_feature_index = 0x0a
+rgb_effects_feature_index = 0x09
+mode_feature_index = 0x0e
+response_timeout_ms = 60
+slot_keys = [0xb4, 0xb5, 0xb6, 0xb7, 0xb8]
+
+[behavior]
+max_sessions = 5
+detect_questions = true
+
+[lighting]
+# Dim, steady colour for all keys when they are not active task indicators.
+background = "#101820"
+# Active G-keys alternate between their full state colour and this percentage.
+flash_enabled = true
+flash_interval_ms = 500
+flash_dim_percent = 5
+
+[navigation]
+# Press an occupied G1-G5 key to open its mapped Codex task.
+enabled = true
+
+[colors]
+idle = "#101820"
+working = "#007aff"
+approval = "#ff9500"
+requested = "#af52de"
+done = "#34c759"
+error = "#ff3b30"
+
+# Change these state names to remap lifecycle events without changing hooks.
+[events]
+user_prompt_submit = "working"
+permission_request = "approval"
+post_tool_success = "working"
+post_tool_failure = "error"
+stop_complete = "done"
+stop_question = "requested"
+stop_failure = "error"

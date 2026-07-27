@@ -1,0 +1,9 @@
+/target/
+.DS_Store
+*.log
+*.sock
+status.json
+.env
+.env.*
+!.env.example
+config.toml
