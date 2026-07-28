@@ -339,6 +339,9 @@ fn tool_failed(value: &Value) -> bool {
 }
 
 #[cfg(test)]
+mod replay_tests;
+
+#[cfg(test)]
 mod tests {
     use serde_json::json;
 

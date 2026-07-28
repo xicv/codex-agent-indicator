@@ -1,0 +1,56 @@
+{
+  "schema": {
+    "codex_version": "0.145.0",
+    "schema_tag": "rust-v0.145.0",
+    "schema_commit": "25af12f7e61572b0bc18ddb1008be543b91519b0",
+    "snapshot_date": "2026-07-28",
+    "source": "https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/hooks/schema/generated"
+  },
+  "scenario": "interrupted turn has no terminal hook and remains observable as working",
+  "events": [
+    {
+      "input": {
+        "session_id": "fixture-interrupted",
+        "transcript_path": "/workspace/.codex/fixtures/interrupted.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "UserPromptSubmit",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-interrupted",
+        "prompt": "Run the long validation."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-interrupted",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-interrupted",
+        "transcript_path": "/workspace/.codex/fixtures/interrupted.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PreToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-interrupted",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-interrupted-1",
+        "tool_input": {
+          "command": "run long validation"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-interrupted",
+          "state": "working"
+        }
+      ]
+    }
+  ]
+}

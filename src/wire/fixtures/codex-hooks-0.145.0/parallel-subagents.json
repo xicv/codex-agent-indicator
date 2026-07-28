@@ -1,0 +1,281 @@
+{
+  "schema": {
+    "codex_version": "0.145.0",
+    "schema_tag": "rust-v0.145.0",
+    "schema_commit": "25af12f7e61572b0bc18ddb1008be543b91519b0",
+    "snapshot_date": "2026-07-28",
+    "source": "https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/hooks/schema/generated"
+  },
+  "scenario": "parallel subagents preserve approval and parent lifecycle truth",
+  "events": [
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "UserPromptSubmit",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-root",
+        "prompt": "Research and validate in parallel."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "SubagentStart",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-spawn-a",
+        "agent_id": "agent-a",
+        "agent_type": "worker"
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PreToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-a-tool",
+        "agent_id": "agent-a",
+        "agent_type": "worker",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-agent-a-1",
+        "tool_input": {
+          "command": "run protected validation"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "SubagentStart",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-spawn-b",
+        "agent_id": "agent-b",
+        "agent_type": "worker"
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PermissionRequest",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-a-approval",
+        "agent_id": "agent-a",
+        "agent_type": "worker",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "run protected validation",
+          "description": "Run the protected validation"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "approval"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PreToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-b-tool",
+        "agent_id": "agent-b",
+        "agent_type": "worker",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-agent-b-1",
+        "tool_input": {
+          "command": "run independent check"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "approval"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PostToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-b-result",
+        "agent_id": "agent-b",
+        "agent_type": "worker",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-agent-b-1",
+        "tool_input": {
+          "command": "run independent check"
+        },
+        "tool_response": {
+          "exit_code": 1,
+          "output": "recoverable check failure"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "approval"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PostToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-a-result",
+        "agent_id": "agent-a",
+        "agent_type": "worker",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-agent-a-1",
+        "tool_input": {
+          "command": "run protected validation"
+        },
+        "tool_response": {
+          "exit_code": 0,
+          "output": "validation passed"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "SubagentStop",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-a-stop",
+        "agent_id": "agent-a",
+        "agent_type": "worker",
+        "agent_transcript_path": null,
+        "stop_hook_active": false,
+        "last_assistant_message": "Protected validation passed."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "SubagentStop",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-agent-b-stop",
+        "agent_id": "agent-b",
+        "agent_type": "worker",
+        "agent_transcript_path": null,
+        "stop_hook_active": false,
+        "last_assistant_message": "Reported the recoverable failure."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parallel",
+        "transcript_path": "/workspace/.codex/fixtures/parallel.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "Stop",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-root",
+        "stop_hook_active": false,
+        "last_assistant_message": "Parallel research and validation are complete."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parallel",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

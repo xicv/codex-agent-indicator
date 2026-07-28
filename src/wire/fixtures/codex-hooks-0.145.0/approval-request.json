@@ -1,0 +1,129 @@
+{
+  "schema": {
+    "codex_version": "0.145.0",
+    "schema_tag": "rust-v0.145.0",
+    "schema_commit": "25af12f7e61572b0bc18ddb1008be543b91519b0",
+    "snapshot_date": "2026-07-28",
+    "source": "https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/hooks/schema/generated"
+  },
+  "scenario": "approval remains visible until the approved tool resumes",
+  "events": [
+    {
+      "input": {
+        "session_id": "fixture-approval",
+        "transcript_path": "/workspace/.codex/fixtures/approval.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "UserPromptSubmit",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-approval",
+        "prompt": "Install the verified release."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-approval",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-approval",
+        "transcript_path": "/workspace/.codex/fixtures/approval.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PreToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-approval",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-approval-1",
+        "tool_input": {
+          "command": "install verified-binary /opt/example/bin"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-approval",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-approval",
+        "transcript_path": "/workspace/.codex/fixtures/approval.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PermissionRequest",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-approval",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "install verified-binary /opt/example/bin",
+          "description": "Install the verified binary"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-approval",
+          "state": "approval"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-approval",
+        "transcript_path": "/workspace/.codex/fixtures/approval.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PostToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-approval",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-approval-1",
+        "tool_input": {
+          "command": "install verified-binary /opt/example/bin"
+        },
+        "tool_response": {
+          "exit_code": 0,
+          "output": "installed"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-approval",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-approval",
+        "transcript_path": "/workspace/.codex/fixtures/approval.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "Stop",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-approval",
+        "stop_hook_active": false,
+        "last_assistant_message": "The verified release is installed."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-approval",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}
