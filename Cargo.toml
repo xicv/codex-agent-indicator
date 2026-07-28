@@ -4,7 +4,24 @@ version = "0.4.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Low-overhead Codex task status indicator for Logitech G915 G-keys"
-publish = false
+repository = "https://github.com/xicv/codex-agent-indicator"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["codex", "logitech", "g915", "macos", "status-indicator"]
+categories = ["command-line-utilities", "hardware-support"]
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/config.example.toml",
+    "/integrations/**",
+    "/launchd/**",
+    "/scripts/**",
+]
 
 [dependencies]
 anyhow = "1.0.104"

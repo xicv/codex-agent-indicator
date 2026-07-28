@@ -4,6 +4,8 @@ Use the five G-keys on a Logitech G915 keyboard as a live Codex task monitor.
 
 ![macOS](https://img.shields.io/badge/macOS-supported-black)
 ![Rust](https://img.shields.io/badge/built_with-Rust-orange)
+[![crates.io](https://img.shields.io/crates/v/codex-agent-indicator.svg)](https://crates.io/crates/codex-agent-indicator)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## What the lights mean
 
@@ -60,6 +62,15 @@ After the first install, open `/hooks` in Codex and trust this command:
 ```
 
 You do not need to restart Codex.
+
+To install only the command-line binary from crates.io:
+
+```sh
+cargo install codex-agent-indicator --version 0.4.0 --locked
+```
+
+The repository installer is still recommended because it also configures the
+Codex hooks and macOS LaunchAgent.
 
 ## Uninstall
 
@@ -204,6 +215,15 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 The project intentionally does not require a formatter pass for validation.
+
+## License
+
+Licensed under either of:
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
 
 ## References
 

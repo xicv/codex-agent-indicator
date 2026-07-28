@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.91
+        run: rustup toolchain install 1.91.0 --profile minimal --component clippy
+
+      - name: Check all targets
+        run: cargo +1.91.0 check --all-targets --locked
+
+      - name: Test all targets
+        run: cargo +1.91.0 test --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo +1.91.0 clippy --all-targets --locked -- -D warnings
+
+      - name: Verify crates.io package
+        run: cargo +1.91.0 publish --registry crates-io --locked --dry-run
