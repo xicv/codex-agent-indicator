@@ -144,6 +144,8 @@ error = "#ff3b30"
 - Increase `flash_interval_ms` for slower flashing.
 - Increase `flash_dim_percent` for a brighter dim phase.
 - Set `flash_enabled = false` for steady status colours.
+- Increase `reassert_interval_ms` if you want less frequent direct-lighting
+  watchdog refreshes.
 - Set `navigation.enabled = false` if G-keys should show status without opening
   tasks.
 - Set `detect_questions = false` to treat every stopped turn as completed.
@@ -151,7 +153,14 @@ error = "#ff3b30"
 ## Behaviour
 
 - The first five active Codex tasks use G1 through G5.
+- Parent turns and subagents are tracked separately, so a child finishing
+  cannot turn the parent task green early.
+- Permission and user-input states take priority over unrelated subagent
+  activity.
 - Finished and attention states are never removed by a timer.
+- Current task lights are restored after the daemon or Mac restarts.
+- A low-rate watchdog reasserts direct lighting mode after keyboard sleep or
+  another lighting app takes control.
 - A newer task cannot displace an unacknowledged green, red, purple, or amber
   state.
 - If all five keys need acknowledgement, open one before another task can be
@@ -186,6 +195,7 @@ Common causes:
 - There is no telemetry, analytics, cloud service, or network server.
 - Hook messages travel through a private user-only Unix socket.
 - The daemon does not read task transcripts.
+- The daemon does not poll Codex databases, processes, or a second app-server.
 - Only the tail of a final assistant message is inspected to distinguish a
   question from a completed response.
 - No Accessibility permission, screen recording, browser control, MCP server,
@@ -202,13 +212,16 @@ The project is one small native Rust binary. It serves as:
 - the G-key task switcher;
 - the configuration and diagnostic command.
 
-Hooks send a small Unix datagram and exit. The daemon batches lighting changes
-into one HID++ frame and sleeps between events. G-key presses use Logitech's
-HID++ `0x8010` feature. Task switching uses Codex's
+Hooks send a small Unix datagram and exit. The daemon tracks task, turn, and
+subagent identity, batches lighting changes into one HID++ frame, restores its
+last state after restarts, and sleeps between events. A low-rate watchdog
+reclaims Logitech direct-lighting mode without polling Codex. G-key presses use
+Logitech's HID++ `0x8010` feature. Task switching uses Codex's
 `codex://threads/<thread-id>` deep link.
 
-Normal keyboard lighting, macros, profiles, key assignments, and onboard memory
-are not modified.
+Only live RGB output and G-key notification diversion are controlled while the
+daemon runs. The program does not edit G HUB macros, profiles, key assignments,
+or onboard memory.
 
 ## Development
 
@@ -235,5 +248,7 @@ at your option.
 - [OpenAI Codex desktop commands and deep links](https://learn.chatgpt.com/docs/reference/commands.md)
 - [Logitech G915](https://www.logitechg.com/en-us/products/gaming-keyboards/g915-low-profile-wireless-mechanical-gaming-keyboard.html)
 - [OpenLogi](https://github.com/AprilNEA/OpenLogi)
+- [Workmux Codex status tracking](https://github.com/raine/workmux/blob/main/src/state/codex_status.rs)
+- [LED Cube Agent Monitor](https://github.com/pirate/led-cube-agent-monitor)
 - [OpenRGB G915 controller](https://github.com/CalcProgrammer1/OpenRGB/tree/master/Controllers/LogitechController/LogitechG915Controller)
 - [hidapi 2.6.6](https://docs.rs/hidapi/2.6.6/hidapi/)

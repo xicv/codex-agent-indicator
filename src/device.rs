@@ -223,6 +223,29 @@ impl G915 {
         self.feature_indices.g_keys.is_some() && self.g_key_diversion_enabled
     }
 
+    pub fn reassert_direct_mode(&self) -> Result<()> {
+        for packet in init_direct_packets(
+            &self.config,
+            self.feature_indices.mode,
+            self.feature_indices.rgb_effects,
+        ) {
+            self.write_packet(&packet)?;
+        }
+        Ok(())
+    }
+
+    pub fn reassert_g_key_navigation(&self) -> Result<bool> {
+        let Some(feature_index) = self.feature_indices.g_keys else {
+            return Ok(false);
+        };
+        self.write_packet(&g_key_diversion_packet(
+            &self.config,
+            feature_index,
+            true,
+        ))?;
+        Ok(true)
+    }
+
     fn initialize_direct(&mut self) -> Result<()> {
         for packet in init_direct_packets(
             &self.config,

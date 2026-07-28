@@ -122,6 +122,9 @@ impl AppConfig {
         if self.lighting.flash_dim_percent > 100 {
             bail!("lighting.flash_dim_percent must not exceed 100");
         }
+        if !(1_000..=60_000).contains(&self.lighting.reassert_interval_ms) {
+            bail!("lighting.reassert_interval_ms must be between 1000 and 60000");
+        }
         Ok(())
     }
 
@@ -197,6 +200,7 @@ pub struct LightingConfig {
     pub flash_enabled: bool,
     pub flash_interval_ms: u64,
     pub flash_dim_percent: u8,
+    pub reassert_interval_ms: u64,
 }
 
 impl Default for LightingConfig {
@@ -206,6 +210,7 @@ impl Default for LightingConfig {
             flash_enabled: true,
             flash_interval_ms: 500,
             flash_dim_percent: 5,
+            reassert_interval_ms: 5_000,
         }
     }
 }

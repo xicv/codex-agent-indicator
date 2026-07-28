@@ -6,13 +6,13 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, Paths};
 use crate::device::G915;
 use crate::navigation::open_codex_thread;
-use crate::state::{Engine, LightingChange};
-use crate::wire::{EventMessage, state_for_hook};
+use crate::state::{Engine, LightingChange, RestoredSlot};
+use crate::wire::{EventMessage, LifecycleTracker};
 
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -85,6 +85,28 @@ impl FlashController {
     }
 }
 
+struct LightingWatchdog {
+    last_reassert: Instant,
+}
+
+impl LightingWatchdog {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(now: Instant) -> Self {
+        Self { last_reassert: now }
+    }
+
+    fn take_if_due(&mut self, now: Instant, interval: Duration) -> bool {
+        if now.saturating_duration_since(self.last_reassert) < interval {
+            return false;
+        }
+        self.last_reassert = now;
+        true
+    }
+}
+
 pub fn run(paths: Paths) -> Result<()> {
     fs::create_dir_all(&paths.runtime_dir).with_context(|| {
         format!(
@@ -104,8 +126,10 @@ pub fn run(paths: Paths) -> Result<()> {
     config.validate()?;
     let mut config_modified = modified_at(&paths.config);
     let mut last_config_check = Instant::now();
-    let mut engine = Engine::new(config.behavior.max_sessions);
+    let mut engine = restore_engine(&paths, config.behavior.max_sessions);
+    let mut lifecycle = LifecycleTracker::default();
     let mut flash = FlashController::new();
+    let mut lighting_watchdog = LightingWatchdog::new();
     let mut hardware = Hardware::new();
     hardware.connect(&config, &engine);
     write_status(&paths, &config, &engine, &hardware)?;
@@ -119,10 +143,13 @@ pub fn run(paths: Paths) -> Result<()> {
                 Ok(message) => {
                     let changed = handle_message(
                         message,
-                        &paths,
+                        ReloadContext {
+                            paths: &paths,
+                            config_modified: &mut config_modified,
+                        },
                         &mut config,
-                        &mut config_modified,
                         &mut engine,
+                        &mut lifecycle,
                         &mut hardware,
                         &mut flash,
                     );
@@ -185,6 +212,7 @@ pub fn run(paths: Paths) -> Result<()> {
                 ) {
                     Ok(()) => {
                         config_modified = current_modified;
+                        lifecycle.clear(None);
                         write_status(&paths, &config, &engine, &hardware)?;
                     }
                     Err(error) => eprintln!("configuration reload rejected: {error:#}"),
@@ -200,31 +228,38 @@ pub fn run(paths: Paths) -> Result<()> {
         if let Some(frame) = flash.frame_if_due(Instant::now(), &config, &engine) {
             hardware.apply(&config, &engine, &frame);
         }
+
+        let reassert_interval =
+            Duration::from_millis(config.lighting.reassert_interval_ms);
+        if lighting_watchdog.take_if_due(Instant::now(), reassert_interval)
+            && hardware.reassert_direct_lighting(&config, &engine)
+        {
+            write_status(&paths, &config, &engine, &hardware)?;
+        }
     }
+}
+
+struct ReloadContext<'a> {
+    paths: &'a Paths,
+    config_modified: &'a mut Option<SystemTime>,
 }
 
 fn handle_message(
     message: EventMessage,
-    paths: &Paths,
+    reload: ReloadContext<'_>,
     config: &mut AppConfig,
-    config_modified: &mut Option<SystemTime>,
     engine: &mut Engine,
+    lifecycle: &mut LifecycleTracker,
     hardware: &mut Hardware,
     flash: &mut FlashController,
 ) -> bool {
+    let hook_state = lifecycle.state_for_event(&message, config);
     match message {
         EventMessage::Hook {
             session_id,
-            hook_event_name,
-            last_assistant_message,
-            tool_failed,
+            ..
         } => {
-            let Some(state) = state_for_hook(
-                &hook_event_name,
-                last_assistant_message.as_deref(),
-                tool_failed,
-                config,
-            ) else {
+            let Some(state) = hook_state else {
                 return false;
             };
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
@@ -237,6 +272,7 @@ fn handle_message(
             true
         }
         EventMessage::Clear { session_id } => {
+            lifecycle.clear(session_id.as_deref());
             let changes = match session_id {
                 Some(session_id) => engine.clear_session(&session_id, config),
                 None => engine.clear_all(config),
@@ -245,10 +281,13 @@ fn handle_message(
             true
         }
         EventMessage::Reload => {
-            if let Err(error) = reload_config(paths, config, engine, hardware, flash) {
+            if let Err(error) =
+                reload_config(reload.paths, config, engine, hardware, flash)
+            {
                 hardware.last_error = Some(format!("configuration reload failed: {error:#}"));
             } else {
-                *config_modified = modified_at(&paths.config);
+                lifecycle.clear(None);
+                *reload.config_modified = modified_at(&reload.paths.config);
             }
             true
         }
@@ -395,6 +434,42 @@ impl Hardware {
         self.last_error = None;
     }
 
+    fn reassert_direct_lighting(&mut self, config: &AppConfig, engine: &Engine) -> bool {
+        let previous_error = self.last_error.clone();
+        if self.keyboard.is_none() {
+            self.connect(config, engine);
+            return self.last_error != previous_error;
+        }
+
+        let keys: Vec<_> = engine
+            .active_lighting(100, config)
+            .iter()
+            .map(|change| (change.key, change.color))
+            .collect();
+        let result = {
+            let keyboard = self.keyboard.as_mut().expect("keyboard checked above");
+            keyboard
+                .reassert_direct_mode()
+                .and_then(|()| keyboard.set_background(config.lighting.background))
+                .and_then(|()| keyboard.set_keys(&keys))
+                .and_then(|()| {
+                    if config.navigation.enabled {
+                        keyboard.reassert_g_key_navigation().map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                })
+        };
+        if let Err(error) = result {
+            self.last_error = Some(format!("G915 direct-lighting watchdog failed: {error:#}"));
+            self.keyboard = None;
+            self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+        } else {
+            self.last_error = None;
+        }
+        self.last_error != previous_error
+    }
+
     fn refresh(&mut self, config: &AppConfig, engine: &Engine) {
         if self.keyboard.is_none() {
             self.connect(config, engine);
@@ -492,6 +567,36 @@ struct DaemonStatus<'a> {
     slots: Vec<crate::state::SlotSnapshot>,
 }
 
+#[derive(Deserialize)]
+struct RestorableStatus {
+    #[serde(default)]
+    slots: Vec<RestoredSlot>,
+}
+
+fn restore_engine(paths: &Paths, max_sessions: usize) -> Engine {
+    let status = match fs::read(&paths.status) {
+        Ok(content) => serde_json::from_slice::<RestorableStatus>(&content),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Engine::new(max_sessions),
+        Err(error) => {
+            eprintln!(
+                "could not restore indicator state from {}: {error}",
+                paths.status.display()
+            );
+            return Engine::new(max_sessions);
+        }
+    };
+    match status {
+        Ok(status) => Engine::restore(max_sessions, status.slots),
+        Err(error) => {
+            eprintln!(
+                "ignored invalid indicator state in {}: {error}",
+                paths.status.display()
+            );
+            Engine::new(max_sessions)
+        }
+    }
+}
+
 fn write_status(
     paths: &Paths,
     config: &AppConfig,
@@ -550,7 +655,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::state::{Engine, StateKind};
 
-    use super::FlashController;
+    use super::{FlashController, LightingWatchdog};
 
     #[test]
     fn alternates_active_g_keys_between_dim_and_full_status_colours() {
@@ -582,5 +687,17 @@ mod tests {
             .frame_if_due(start + Duration::from_millis(1_000), &config, &engine)
             .expect("bright frame");
         assert_eq!(bright[0].color, config.colors.approval);
+    }
+
+    #[test]
+    fn periodically_reasserts_direct_lighting_mode() {
+        let start = Instant::now();
+        let mut watchdog = LightingWatchdog::new_at(start);
+        let interval = Duration::from_secs(5);
+
+        assert!(!watchdog.take_if_due(start + interval - Duration::from_millis(1), interval));
+        assert!(watchdog.take_if_due(start + interval, interval));
+        assert!(!watchdog.take_if_due(start + interval + Duration::from_secs(1), interval));
+        assert!(watchdog.take_if_due(start + interval * 2, interval));
     }
 }

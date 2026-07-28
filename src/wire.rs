@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -11,7 +13,10 @@ const MAX_MESSAGE_TAIL_BYTES: usize = 2_048;
 pub enum EventMessage {
     Hook {
         session_id: String,
+        run_id: String,
         hook_event_name: String,
+        is_subagent: bool,
+        tool_name: Option<String>,
         last_assistant_message: Option<String>,
         tool_failed: bool,
     },
@@ -30,6 +35,14 @@ pub struct HookInput {
     pub session_id: String,
     pub hook_event_name: String,
     #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
     pub last_assistant_message: Option<String>,
     #[serde(default)]
     pub tool_response: Option<Value>,
@@ -37,9 +50,21 @@ pub struct HookInput {
 
 impl HookInput {
     pub fn into_event(self) -> EventMessage {
+        let is_subagent = matches!(
+            self.hook_event_name.as_str(),
+            "SubagentStart" | "SubagentStop"
+        ) || non_empty(self.agent_id.as_deref()).is_some()
+            || non_empty(self.agent_type.as_deref()).is_some();
+        let run_id = non_empty(self.turn_id.as_deref())
+            .or_else(|| non_empty(self.agent_id.as_deref()))
+            .unwrap_or(&self.session_id)
+            .to_owned();
         EventMessage::Hook {
             session_id: self.session_id,
+            run_id,
             hook_event_name: self.hook_event_name,
+            is_subagent,
+            tool_name: self.tool_name,
             last_assistant_message: self
                 .last_assistant_message
                 .as_deref()
@@ -47,6 +72,154 @@ impl HookInput {
             tool_failed: self.tool_response.as_ref().is_some_and(tool_failed),
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct LifecycleTracker {
+    sessions: HashMap<String, SessionActivity>,
+}
+
+#[derive(Debug, Default)]
+struct SessionActivity {
+    active_runs: BTreeSet<String>,
+    waiting_runs: BTreeMap<String, StateKind>,
+}
+
+impl LifecycleTracker {
+    pub fn state_for_event(
+        &mut self,
+        event: &EventMessage,
+        config: &AppConfig,
+    ) -> Option<StateKind> {
+        let EventMessage::Hook {
+            session_id,
+            run_id,
+            hook_event_name,
+            is_subagent,
+            tool_name,
+            last_assistant_message,
+            tool_failed,
+        } = event
+        else {
+            return None;
+        };
+
+        if hook_event_name == "Stop" && !is_subagent {
+            self.sessions.remove(session_id);
+            return state_for_hook(
+                hook_event_name,
+                last_assistant_message.as_deref(),
+                *tool_failed,
+                config,
+            );
+        }
+        if hook_event_name == "SessionEnd" {
+            self.sessions.remove(session_id);
+            return None;
+        }
+
+        match hook_event_name.as_str() {
+            "UserPromptSubmit" if !is_subagent => {
+                let activity = self.sessions.entry(session_id.clone()).or_default();
+                activity.active_runs.clear();
+                activity.waiting_runs.clear();
+                activity.active_runs.insert(run_id.clone());
+                Some(config.events.user_prompt_submit)
+            }
+            "PermissionRequest" => {
+                let activity = self.sessions.entry(session_id.clone()).or_default();
+                activity.active_runs.insert(run_id.clone());
+                activity
+                    .waiting_runs
+                    .insert(run_id.clone(), config.events.permission_request);
+                Some(activity.state_or(config.events.permission_request))
+            }
+            "PreToolUse" => {
+                let activity = self.sessions.entry(session_id.clone()).or_default();
+                activity.active_runs.insert(run_id.clone());
+                if tool_name.as_deref().is_some_and(tool_requests_user_input) {
+                    activity
+                        .waiting_runs
+                        .insert(run_id.clone(), config.events.stop_question);
+                } else {
+                    activity.waiting_runs.remove(run_id);
+                }
+                Some(activity.state_or(config.events.user_prompt_submit))
+            }
+            "PostToolUse" => {
+                let activity = self.sessions.entry(session_id.clone()).or_default();
+                activity.active_runs.insert(run_id.clone());
+                activity.waiting_runs.remove(run_id);
+                if *tool_failed {
+                    Some(config.events.post_tool_failure)
+                } else {
+                    Some(activity.state_or(config.events.post_tool_success))
+                }
+            }
+            "SubagentStart" => {
+                let activity = self.sessions.entry(session_id.clone()).or_default();
+                activity.active_runs.insert(run_id.clone());
+                Some(activity.state_or(config.events.user_prompt_submit))
+            }
+            "SubagentStop" | "Stop" if *is_subagent => {
+                let activity = self.sessions.get_mut(session_id)?;
+                activity.active_runs.remove(run_id);
+                activity.waiting_runs.remove(run_id);
+                let state = activity.state_or(config.events.user_prompt_submit);
+                if activity.active_runs.is_empty() && activity.waiting_runs.is_empty() {
+                    self.sessions.remove(session_id);
+                }
+                Some(state)
+            }
+            _ => state_for_hook(
+                hook_event_name,
+                last_assistant_message.as_deref(),
+                *tool_failed,
+                config,
+            ),
+        }
+    }
+
+    pub fn clear(&mut self, session_id: Option<&str>) {
+        if let Some(session_id) = session_id {
+            self.sessions.remove(session_id);
+        } else {
+            self.sessions.clear();
+        }
+    }
+}
+
+impl SessionActivity {
+    fn state_or(&self, fallback: StateKind) -> StateKind {
+        if self.waiting_runs.values().any(|state| *state == StateKind::Approval) {
+            StateKind::Approval
+        } else if self
+            .waiting_runs
+            .values()
+            .any(|state| *state == StateKind::Requested)
+        {
+            StateKind::Requested
+        } else {
+            self.waiting_runs
+                .values()
+                .next()
+                .copied()
+                .unwrap_or(fallback)
+        }
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn tool_requests_user_input(tool_name: &str) -> bool {
+    tool_name
+        .to_ascii_lowercase()
+        .ends_with("request_user_input")
 }
 
 pub fn state_for_hook(
@@ -166,10 +339,22 @@ mod tests {
     use crate::config::AppConfig;
 
     use super::{
-        assistant_message_reports_failure, assistant_message_requests_input, state_for_hook,
-        tool_failed,
+        EventMessage, HookInput, LifecycleTracker, assistant_message_reports_failure,
+        assistant_message_requests_input, state_for_hook, tool_failed,
     };
     use crate::state::StateKind;
+
+    fn hook(run_id: &str, event: &str, is_subagent: bool) -> EventMessage {
+        EventMessage::Hook {
+            session_id: "task".to_owned(),
+            run_id: run_id.to_owned(),
+            hook_event_name: event.to_owned(),
+            is_subagent,
+            tool_name: None,
+            last_assistant_message: None,
+            tool_failed: false,
+        }
+    }
 
     #[test]
     fn recognizes_input_request_without_transcript_scraping() {
@@ -211,6 +396,88 @@ mod tests {
         assert_eq!(
             state_for_hook("Stop", Some("All done."), false, &config),
             Some(StateKind::Done)
+        );
+    }
+
+    #[test]
+    fn extracts_turn_and_subagent_identity_without_transcript_content() {
+        let input: HookInput = serde_json::from_value(json!({
+            "session_id": "task",
+            "turn_id": "child-turn",
+            "hook_event_name": "SubagentStart",
+            "agent_id": "child",
+            "agent_type": "worker",
+            "tool_name": "exec"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            input.into_event(),
+            EventMessage::Hook {
+                run_id,
+                is_subagent: true,
+                tool_name: Some(tool_name),
+                ..
+            } if run_id == "child-turn" && tool_name == "exec"
+        ));
+    }
+
+    #[test]
+    fn subagent_completion_cannot_finish_a_working_parent() {
+        let config = AppConfig::default();
+        let mut tracker = LifecycleTracker::default();
+
+        assert_eq!(
+            tracker.state_for_event(&hook("root-turn", "UserPromptSubmit", false), &config),
+            Some(StateKind::Working)
+        );
+        assert_eq!(
+            tracker.state_for_event(&hook("child-turn", "SubagentStart", true), &config),
+            Some(StateKind::Working)
+        );
+        assert_eq!(
+            tracker.state_for_event(&hook("child-turn", "SubagentStop", true), &config),
+            Some(StateKind::Working)
+        );
+        assert_eq!(
+            tracker.state_for_event(&hook("root-turn", "Stop", false), &config),
+            Some(StateKind::Done)
+        );
+    }
+
+    #[test]
+    fn attention_state_outlives_unrelated_subagent_activity() {
+        let config = AppConfig::default();
+        let mut tracker = LifecycleTracker::default();
+
+        tracker.state_for_event(&hook("root-turn", "UserPromptSubmit", false), &config);
+        tracker.state_for_event(&hook("child-turn", "SubagentStart", true), &config);
+        assert_eq!(
+            tracker.state_for_event(&hook("root-turn", "PermissionRequest", false), &config),
+            Some(StateKind::Approval)
+        );
+        assert_eq!(
+            tracker.state_for_event(&hook("child-turn", "SubagentStop", true), &config),
+            Some(StateKind::Approval)
+        );
+    }
+
+    #[test]
+    fn request_user_input_is_detected_before_the_turn_stops() {
+        let config = AppConfig::default();
+        let mut tracker = LifecycleTracker::default();
+        let mut request = hook("root-turn", "PreToolUse", false);
+        if let EventMessage::Hook { tool_name, .. } = &mut request {
+            *tool_name = Some("functions.request_user_input".to_owned());
+        }
+
+        assert_eq!(
+            tracker.state_for_event(&request, &config),
+            Some(StateKind::Requested)
+        );
+        assert_eq!(
+            tracker.state_for_event(&hook("root-turn", "PostToolUse", false), &config),
+            Some(StateKind::Working)
         );
     }
 

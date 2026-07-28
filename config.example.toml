@@ -24,6 +24,8 @@ background = "#101820"
 flash_enabled = true
 flash_interval_ms = 500
 flash_dim_percent = 5
+# Reclaim direct lighting mode after keyboard sleep or another lighting app.
+reassert_interval_ms = 5000
 
 [navigation]
 # Press an occupied G1-G5 key to open its mapped Codex task.
