@@ -8,10 +8,10 @@ use super::{EventMessage, HookInput, LifecycleTracker};
 
 const CODEX_VERSION: &str = "0.145.0";
 const SCHEMA_TAG: &str = "rust-v0.145.0";
-const SCHEMA_COMMIT: &str = "1635de866c61d1b76e50b31928ee6d61482435a8";
+const SCHEMA_COMMIT: &str = "25af12f7e61572b0bc18ddb1008be543b91519b0";
 const SCHEMA_SNAPSHOT_DATE: &str = "2026-07-28";
 const SCHEMA_SOURCE: &str =
-    "https://github.com/openai/codex/tree/rust-v0.145.0/codex-rs/hooks/schema/generated";
+    "https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/hooks/schema/generated";
 const PARENT_COMPLETES: &str =
     include_str!("fixtures/codex-hooks-0.145.0/parent-completes.json");
 const APPROVAL_REQUEST: &str =

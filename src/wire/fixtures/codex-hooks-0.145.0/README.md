@@ -2,12 +2,12 @@
 
 These are synthetic, privacy-scrubbed lifecycle fixtures for Codex CLI
 `0.145.0`. They are pinned to the official OpenAI `rust-v0.145.0` tag at commit
-`1635de866c61d1b76e50b31928ee6d61482435a8`, captured on 2026-07-28.
+`25af12f7e61572b0bc18ddb1008be543b91519b0`, captured on 2026-07-28.
 
 The `schema/` files preserve the command-input schema content used by these
 scenarios:
 
-<https://github.com/openai/codex/tree/rust-v0.145.0/codex-rs/hooks/schema/generated>
+<https://github.com/openai/codex/tree/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/hooks/schema/generated>
 
 The scenarios cover:
 

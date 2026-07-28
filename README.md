@@ -20,6 +20,9 @@ Use the five G-keys on a Logitech G915 keyboard as a live Codex task monitor.
 G1 through G5 each represent one Codex task. Active keys flash brightly while
 the rest of the keyboard stays on with a dim, steady background.
 
+The indicator intentionally uses only G1 through G5. It leaves F1 through F12,
+M1 through M3, MR, media controls, macros, and onboard profiles untouched.
+
 Green, red, purple, and amber stay visible until you press their G-key. The key
 brings Codex to the foreground, selects the matching task in its sidebar, and
 then clears the acknowledged light. A blue key stays blue because its task is
@@ -45,7 +48,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.1 --locked
+cargo install codex-agent-indicator --version 0.4.2 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -54,7 +57,7 @@ does not add Codex hooks or create the macOS LaunchAgent.
 To upgrade or reinstall the same version:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.1 --locked --force
+cargo install codex-agent-indicator --version 0.4.2 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
