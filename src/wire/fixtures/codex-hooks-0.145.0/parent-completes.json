@@ -1,0 +1,105 @@
+{
+  "schema": {
+    "codex_version": "0.145.0",
+    "schema_tag": "rust-v0.145.0",
+    "schema_commit": "1635de866c61d1b76e50b31928ee6d61482435a8",
+    "snapshot_date": "2026-07-28",
+    "source": "https://github.com/openai/codex/tree/rust-v0.145.0/codex-rs/hooks/schema/generated"
+  },
+  "scenario": "parent task completes",
+  "events": [
+    {
+      "input": {
+        "session_id": "fixture-parent",
+        "transcript_path": "/workspace/.codex/fixtures/parent.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "UserPromptSubmit",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-parent",
+        "prompt": "Run the checks."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parent",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parent",
+        "transcript_path": "/workspace/.codex/fixtures/parent.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PreToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-parent",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-parent-1",
+        "tool_input": {
+          "command": "cargo test --locked"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parent",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parent",
+        "transcript_path": "/workspace/.codex/fixtures/parent.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "PostToolUse",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-parent",
+        "tool_name": "Bash",
+        "tool_use_id": "tool-parent-1",
+        "tool_input": {
+          "command": "cargo test --locked"
+        },
+        "tool_response": {
+          "exit_code": 0,
+          "output": "tests passed"
+        }
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parent",
+          "state": "working"
+        }
+      ]
+    },
+    {
+      "input": {
+        "session_id": "fixture-parent",
+        "transcript_path": "/workspace/.codex/fixtures/parent.jsonl",
+        "cwd": "/workspace/project",
+        "hook_event_name": "Stop",
+        "model": "fixture-model",
+        "permission_mode": "default",
+        "turn_id": "turn-parent",
+        "stop_hook_active": false,
+        "last_assistant_message": "All checks passed."
+      },
+      "slots": [
+        {
+          "slot": 1,
+          "key": "G1",
+          "session_id": "fixture-parent",
+          "state": "done"
+        }
+      ]
+    }
+  ]
+}

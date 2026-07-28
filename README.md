@@ -251,6 +251,17 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
+Lifecycle replay tests use privacy-scrubbed, version-labelled Codex hook JSON
+and the matching official input schemas. They exercise the complete adapter →
+lifecycle tracker → G-key slot path:
+
+```sh
+cargo test wire::replay_tests
+```
+
+When the Codex hook schema changes, add a new fixture snapshot instead of
+rewriting the historical one.
+
 The project intentionally does not require a formatter pass for validation.
 
 ## License
