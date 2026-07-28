@@ -269,7 +269,7 @@ impl Default for EventConfig {
             user_prompt_submit: StateKind::Working,
             permission_request: StateKind::Approval,
             post_tool_success: StateKind::Working,
-            post_tool_failure: StateKind::Error,
+            post_tool_failure: StateKind::Working,
             stop_complete: StateKind::Done,
             stop_question: StateKind::Requested,
             stop_failure: StateKind::Error,
@@ -317,6 +317,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.device.slot_keys, [0xb4, 0xb5, 0xb6, 0xb7, 0xb8]);
         assert!(config.navigation.enabled);
+        assert_eq!(config.events.post_tool_failure, crate::state::StateKind::Working);
     }
 
     #[test]

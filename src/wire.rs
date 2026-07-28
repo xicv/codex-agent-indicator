@@ -55,8 +55,13 @@ impl HookInput {
             "SubagentStart" | "SubagentStop"
         ) || non_empty(self.agent_id.as_deref()).is_some()
             || non_empty(self.agent_type.as_deref()).is_some();
-        let run_id = non_empty(self.turn_id.as_deref())
-            .or_else(|| non_empty(self.agent_id.as_deref()))
+        let run_id = if is_subagent {
+            non_empty(self.agent_id.as_deref())
+                .or_else(|| non_empty(self.turn_id.as_deref()))
+        } else {
+            non_empty(self.turn_id.as_deref())
+                .or_else(|| non_empty(self.agent_id.as_deref()))
+        }
             .unwrap_or(&self.session_id)
             .to_owned();
         EventMessage::Hook {
@@ -150,11 +155,12 @@ impl LifecycleTracker {
                 let activity = self.sessions.entry(session_id.clone()).or_default();
                 activity.active_runs.insert(run_id.clone());
                 activity.waiting_runs.remove(run_id);
-                if *tool_failed {
-                    Some(config.events.post_tool_failure)
+                let fallback = if *tool_failed {
+                    config.events.post_tool_failure
                 } else {
-                    Some(activity.state_or(config.events.post_tool_success))
-                }
+                    config.events.post_tool_success
+                };
+                Some(activity.state_or(fallback))
             }
             "SubagentStart" => {
                 let activity = self.sessions.entry(session_id.clone()).or_default();
@@ -418,8 +424,84 @@ mod tests {
                 is_subagent: true,
                 tool_name: Some(tool_name),
                 ..
-            } if run_id == "child-turn" && tool_name == "exec"
+            } if run_id == "child" && tool_name == "exec"
         ));
+    }
+
+    #[test]
+    fn correlates_subagent_events_by_stable_agent_id_across_turn_ids() {
+        let config = AppConfig::default();
+        let mut tracker = LifecycleTracker::default();
+        let event = |event: &str, turn_id: &str, tool_name: Option<&str>| {
+            let input: HookInput = serde_json::from_value(json!({
+                "session_id": "parent-task",
+                "turn_id": turn_id,
+                "hook_event_name": event,
+                "agent_id": "stable-child",
+                "agent_type": "worker",
+                "tool_name": tool_name
+            }))
+            .unwrap();
+            input.into_event()
+        };
+
+        tracker.state_for_event(&hook("root-turn", "UserPromptSubmit", false), &config);
+        tracker.state_for_event(
+            &event("SubagentStart", "spawn-turn", None),
+            &config,
+        );
+        assert_eq!(
+            tracker.state_for_event(
+                &event(
+                    "PreToolUse",
+                    "tool-turn",
+                    Some("functions.request_user_input"),
+                ),
+                &config,
+            ),
+            Some(StateKind::Requested)
+        );
+        assert_eq!(
+            tracker.state_for_event(
+                &event("SubagentStop", "completion-turn", None),
+                &config,
+            ),
+            Some(StateKind::Working)
+        );
+    }
+
+    #[test]
+    fn ordinary_tool_failure_does_not_claim_the_whole_task_stopped() {
+        let config = AppConfig::default();
+        let mut tracker = LifecycleTracker::default();
+        let mut failure = hook("root-turn", "PostToolUse", false);
+        if let EventMessage::Hook { tool_failed, .. } = &mut failure {
+            *tool_failed = true;
+        }
+
+        assert_eq!(
+            tracker.state_for_event(&failure, &config),
+            Some(StateKind::Working)
+        );
+    }
+
+    #[test]
+    fn unrelated_tool_failure_does_not_hide_an_approval_request() {
+        let config = AppConfig::default();
+        let mut tracker = LifecycleTracker::default();
+        tracker.state_for_event(
+            &hook("approval-turn", "PermissionRequest", false),
+            &config,
+        );
+        let mut failure = hook("tool-turn", "PostToolUse", true);
+        if let EventMessage::Hook { tool_failed, .. } = &mut failure {
+            *tool_failed = true;
+        }
+
+        assert_eq!(
+            tracker.state_for_event(&failure, &config),
+            Some(StateKind::Approval)
+        );
     }
 
     #[test]

@@ -171,6 +171,8 @@ error = "#ff3b30"
   cannot turn the parent task green early.
 - Permission and user-input states take priority over unrelated subagent
   activity.
+- A failed individual tool remains blue while Codex handles it; red is reserved
+  for a terminal turn failure.
 - Finished and attention states are never removed by a timer.
 - Current task lights are restored after the daemon or Mac restarts.
 - A low-rate watchdog reasserts direct lighting mode after keyboard sleep or
@@ -200,6 +202,10 @@ Common causes:
 - Logitech G HUB may overwrite the indicator colours if it is running an active
   lighting effect.
 - Codex may ask you to trust the hook command after installation.
+- Codex does not currently emit a terminal `Stop` hook for every app-level
+  system failure, such as model-capacity errors. The last blue state can remain
+  until the next lifecycle event; use `codex-agent-indicator set error TASK_ID`
+  to correct it manually.
 - The daemon log is stored at
   `~/Library/Logs/codex-agent-indicator.log`.
 
@@ -227,11 +233,11 @@ The project is one small native Rust binary. It serves as:
 - the configuration and diagnostic command.
 
 Hooks send a small Unix datagram and exit. The daemon tracks task, turn, and
-subagent identity, batches lighting changes into one HID++ frame, restores its
-last state after restarts, and sleeps between events. A low-rate watchdog
-reclaims Logitech direct-lighting mode without polling Codex. G-key presses use
-Logitech's HID++ `0x8010` feature. Task switching uses Codex's
-`codex://threads/<thread-id>` deep link.
+subagent identity, batches lighting changes into one HID++ frame, debounces
+unchanged status-file writes, restores its last state after restarts, and sleeps
+between events. A low-rate watchdog reclaims Logitech direct-lighting mode
+without polling Codex. G-key presses use Logitech's HID++ `0x8010` feature.
+Task switching uses Codex's `codex://threads/<thread-id>` deep link.
 
 Only live RGB output and G-key notification diversion are controlled while the
 daemon runs. The program does not edit G HUB macros, profiles, key assignments,
