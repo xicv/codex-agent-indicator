@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,8 @@ use crate::wire::{message_tail, state_for_hook};
 
 const JOURNAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RECOVERY_TAIL_BYTES: u64 = 8 * 1_024 * 1_024;
+const SESSION_META_MAX_BYTES: u64 = 256 * 1_024;
+const IGNORED_SESSION_CACHE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalTransition {
@@ -27,6 +29,12 @@ pub struct SessionJournalTransition {
     pub occurred_at: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct JournalRestore {
+    pub admitted_sessions: HashSet<String>,
+    pub transitions: Vec<SessionJournalTransition>,
+}
+
 pub struct JournalReader {
     path: PathBuf,
     file: File,
@@ -39,8 +47,27 @@ pub struct JournalReader {
 pub struct JournalTracker {
     sessions_root: PathBuf,
     readers: HashMap<String, JournalReader>,
+    ignored_sessions: HashSet<String>,
+    ignored_order: VecDeque<String>,
     next_poll: Instant,
     last_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionMetaRecord {
+    #[serde(rename = "type")]
+    record_type: String,
+    payload: SessionMetaPayload,
+}
+
+#[derive(Deserialize)]
+struct SessionMetaPayload {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    source: serde_json::Value,
+    #[serde(default)]
+    originator: String,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +232,8 @@ impl JournalTracker {
         Self {
             sessions_root,
             readers: HashMap::new(),
+            ignored_sessions: HashSet::new(),
+            ignored_order: VecDeque::new(),
             next_poll: Instant::now() + JOURNAL_POLL_INTERVAL,
             last_error: None,
         }
@@ -214,7 +243,7 @@ impl JournalTracker {
         &mut self,
         session_ids: I,
         config: &AppConfig,
-    ) -> Vec<SessionJournalTransition>
+    ) -> JournalRestore
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -224,28 +253,41 @@ impl JournalTracker {
             .map(|session_id| session_id.as_ref().to_owned())
             .collect::<HashSet<_>>();
         if targets.is_empty() {
-            return Vec::new();
+            return JournalRestore::default();
         }
 
         let paths = match discover_transcripts(&self.sessions_root, &targets) {
             Ok(paths) => paths,
             Err(error) => {
                 self.record_error(format!("{error:#}"));
-                return Vec::new();
+                return JournalRestore::default();
             }
         };
 
-        let mut restored = Vec::new();
+        let mut restored = JournalRestore::default();
         let mut errors = Vec::new();
         for session_id in targets {
             let Some(path) = paths.get(&session_id) else {
                 continue;
             };
+            match is_top_level_codex_desktop_journal(path, &session_id) {
+                Ok(true) => {
+                    restored.admitted_sessions.insert(session_id.clone());
+                }
+                Ok(false) => {
+                    self.remember_ignored(session_id);
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!("{error:#}"));
+                    continue;
+                }
+            }
             match JournalReader::recover(path, config) {
                 Ok((reader, transition)) => {
                     self.readers.insert(session_id.clone(), reader);
                     if let Some(transition) = transition {
-                        restored.push(SessionJournalTransition {
+                        restored.transitions.push(SessionJournalTransition {
                             session_id,
                             state: transition.state,
                             occurred_at: transition.occurred_at,
@@ -259,18 +301,25 @@ impl JournalTracker {
         restored
     }
 
-    pub fn register_live(&mut self, session_id: &str, path: &Path) -> Result<()> {
+    pub fn register_live(&mut self, session_id: &str, path: &Path) -> Result<bool> {
+        if self.ignored_sessions.contains(session_id) {
+            return Ok(false);
+        }
         let path = validate_transcript_path(&self.sessions_root, session_id, path)?;
         if self
             .readers
             .get(session_id)
             .is_some_and(|reader| reader.path == path)
         {
-            return Ok(());
+            return Ok(true);
+        }
+        if !is_top_level_codex_desktop_journal(&path, session_id)? {
+            self.remember_ignored(session_id.to_owned());
+            return Ok(false);
         }
         self.readers
             .insert(session_id.to_owned(), JournalReader::follow(&path)?);
-        Ok(())
+        Ok(true)
     }
 
     pub fn poll_interval(&self, now: Instant) -> Duration {
@@ -325,8 +374,12 @@ impl JournalTracker {
     pub fn clear(&mut self, session_id: Option<&str>) {
         if let Some(session_id) = session_id {
             self.readers.remove(session_id);
+            self.ignored_sessions.remove(session_id);
+            self.ignored_order.retain(|ignored| ignored != session_id);
         } else {
             self.readers.clear();
+            self.ignored_sessions.clear();
+            self.ignored_order.clear();
         }
     }
 
@@ -352,6 +405,43 @@ impl JournalTracker {
             self.record_error(errors.join("; "));
         }
     }
+
+    fn remember_ignored(&mut self, session_id: String) {
+        if !self.ignored_sessions.insert(session_id.clone()) {
+            return;
+        }
+        self.ignored_order.push_back(session_id);
+        while self.ignored_order.len() > IGNORED_SESSION_CACHE_CAPACITY {
+            if let Some(expired) = self.ignored_order.pop_front() {
+                self.ignored_sessions.remove(&expired);
+            }
+        }
+    }
+}
+
+fn is_top_level_codex_desktop_journal(path: &Path, expected_session_id: &str) -> Result<bool> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to inspect Codex session metadata {}", path.display()))?;
+    let mut source = BufReader::new(file).take(SESSION_META_MAX_BYTES);
+    let mut line = Vec::new();
+    let bytes_read = source.read_until(b'\n', &mut line)?;
+    if bytes_read == 0 {
+        return Ok(false);
+    }
+    if !line.ends_with(b"\n") {
+        bail!(
+            "Codex session metadata exceeds {} bytes in {}",
+            SESSION_META_MAX_BYTES,
+            path.display()
+        );
+    }
+
+    let record: SessionMetaRecord =
+        serde_json::from_slice(&line).context("invalid Codex session metadata record")?;
+    Ok(record.record_type == "session_meta"
+        && record.payload.id == expected_session_id
+        && record.payload.source.as_str() == Some("vscode")
+        && record.payload.originator == "Codex Desktop")
 }
 
 fn validate_transcript_path(
@@ -463,6 +553,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -597,10 +688,10 @@ mod tests {
         let nested = root.join("2026").join("07").join("28");
         fs::create_dir_all(&nested).unwrap();
         let path = nested.join("rollout-scrubbed-session-a.jsonl");
-        fs::write(&path, LIFECYCLE).unwrap();
+        fs::write(&path, desktop_journal("session-a")).unwrap();
         fs::write(
             nested.join("rollout-scrubbed-untracked-session.jsonl"),
-            LIFECYCLE,
+            desktop_journal("untracked-session"),
         )
         .unwrap();
         let config = AppConfig::default();
@@ -608,9 +699,100 @@ mod tests {
 
         let restored = tracker.restore(["session-a"], &config);
 
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].session_id, "session-a");
-        assert_eq!(restored[0].state, StateKind::Working);
+        assert_eq!(restored.transitions.len(), 1);
+        assert_eq!(restored.transitions[0].session_id, "session-a");
+        assert_eq!(restored.transitions[0].state, StateKind::Working);
+        assert_eq!(
+            restored.admitted_sessions,
+            HashSet::from(["session-a".to_owned()])
+        );
+        assert_eq!(tracker.source_count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_registration_admits_only_top_level_codex_desktop_journals() {
+        let root = temporary_directory("origin-root");
+        let app = named_journal(
+            &root,
+            "app-session",
+            &desktop_journal("app-session"),
+        );
+        let cli = named_journal(
+            &root,
+            "cli-session",
+            &journal_with_origin("cli-session", json!("cli"), "codex-tui"),
+        );
+        let claude = named_journal(
+            &root,
+            "claude-session",
+            &journal_with_origin("claude-session", json!("vscode"), "Claude Code"),
+        );
+        let subagent = named_journal(
+            &root,
+            "subagent-session",
+            &journal_with_origin(
+                "subagent-session",
+                json!({"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}}),
+                "Codex Desktop",
+            ),
+        );
+        let mut tracker = JournalTracker::new(root.clone());
+
+        assert!(tracker.register_live("app-session", &app).unwrap());
+        assert!(!tracker.register_live("cli-session", &cli).unwrap());
+        assert!(!tracker.register_live("claude-session", &claude).unwrap());
+        assert!(!tracker.register_live("subagent-session", &subagent).unwrap());
+        assert_eq!(tracker.source_count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_registration_fails_closed_without_matching_session_metadata() {
+        let root = temporary_directory("metadata-root");
+        let missing_metadata = named_journal(&root, "missing-meta", LIFECYCLE);
+        let mismatched_metadata = named_journal(
+            &root,
+            "expected-session",
+            &desktop_journal("different-session"),
+        );
+        let mut tracker = JournalTracker::new(root.clone());
+
+        assert!(
+            !tracker
+                .register_live("missing-meta", &missing_metadata)
+                .unwrap()
+        );
+        assert!(
+            !tracker
+                .register_live("expected-session", &mismatched_metadata)
+                .unwrap()
+        );
+        assert_eq!(tracker.source_count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_restore_reports_only_reopenable_codex_desktop_sessions() {
+        let root = temporary_directory("restore-origin-root");
+        named_journal(&root, "app-session", &desktop_journal("app-session"));
+        named_journal(
+            &root,
+            "cli-session",
+            &journal_with_origin("cli-session", json!("cli"), "codex-tui"),
+        );
+        let config = AppConfig::default();
+        let mut tracker = JournalTracker::new(root.clone());
+
+        let restored =
+            tracker.restore(["app-session", "cli-session", "missing-session"], &config);
+
+        assert_eq!(
+            restored.admitted_sessions,
+            HashSet::from(["app-session".to_owned()])
+        );
+        assert_eq!(restored.transitions.len(), 1);
+        assert_eq!(restored.transitions[0].session_id, "app-session");
         assert_eq!(tracker.source_count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
@@ -628,6 +810,42 @@ mod tests {
         assert!(error.to_string().contains("outside the Codex sessions directory"));
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    fn desktop_journal(session_id: &str) -> String {
+        journal_with_origin(session_id, json!("vscode"), "Codex Desktop")
+    }
+
+    fn journal_with_origin(
+        session_id: &str,
+        source: serde_json::Value,
+        originator: &str,
+    ) -> String {
+        format!(
+            "{}\n{LIFECYCLE}",
+            serde_json::to_string(&json!({
+                "timestamp": "2026-07-28T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "source": source,
+                    "originator": originator,
+                    "cli_version": "0.146.0-alpha.3.1",
+                    "cwd": "/workspace"
+                }
+            }))
+            .unwrap()
+        )
+    }
+
+    fn named_journal(
+        root: &std::path::Path,
+        session_id: &str,
+        content: &str,
+    ) -> std::path::PathBuf {
+        let path = root.join(format!("rollout-scrubbed-{session_id}.jsonl"));
+        fs::write(&path, content).unwrap();
+        path
     }
 
     fn temporary_journal(content: &str) -> std::path::PathBuf {

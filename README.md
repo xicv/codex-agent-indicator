@@ -1,6 +1,7 @@
 # Codex Agent Indicator
 
-Use the five G-keys on a Logitech G915 keyboard as a live Codex task monitor.
+Use the five G-keys on a Logitech G915 keyboard as a live Codex Desktop task
+monitor.
 
 ![macOS](https://img.shields.io/badge/macOS-supported-black)
 ![Rust](https://img.shields.io/badge/built_with-Rust-orange)
@@ -17,8 +18,10 @@ Use the five G-keys on a Logitech G915 keyboard as a live Codex task monitor.
 | 🟢 Green | Codex finished successfully |
 | 🔴 Red | Codex stopped with an error |
 
-G1 through G5 each represent one Codex task. Active keys flash brightly while
-the rest of the keyboard stays on with a dim, steady background.
+G1 through G5 each represent one top-level task from the Codex desktop app.
+Active keys flash brightly while the rest of the keyboard stays on with a dim,
+steady background. Codex CLI, `codex exec`, Claude Code integrations, other
+apps, and ephemeral tasks do not occupy G-keys.
 
 The indicator intentionally uses only G1 through G5. It leaves F1 through F12,
 M1 through M3, MR, media controls, macros, and onboard profiles untouched.
@@ -48,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.4 --locked
+cargo install codex-agent-indicator --version 0.4.5 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -69,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.4 --locked --force
+cargo install codex-agent-indicator --version 0.4.5 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -182,9 +185,13 @@ error = "#ff3b30"
 
 ## Behaviour
 
-- The first five active Codex tasks use G1 through G5.
-- Parent turns and subagents are tracked separately, so a child finishing
-  cannot turn the parent task green early.
+- The first five top-level Codex Desktop tasks use G1 through G5.
+- A task is admitted only when its matching persisted journal identifies
+  `Codex Desktop` as its origin. Codex CLI, `codex exec`, Claude Code
+  integrations, other apps, ephemeral sessions, and standalone subagent
+  sessions are ignored.
+- Child activity within an admitted desktop task can update its parent light,
+  but never receives a separate G-key.
 - Fast hooks are reconciled against the known task's local `task_started` and
   `task_complete` journal records. A missed terminal hook therefore corrects
   itself within about 250 ms instead of leaving a stale blue key.
@@ -193,7 +200,9 @@ error = "#ff3b30"
 - A failed individual tool remains blue while Codex handles it; red is reserved
   for a terminal turn failure.
 - Finished and attention states are never removed by a timer.
-- Current task lights are restored after the daemon or Mac restarts.
+- Current Codex Desktop task lights are restored after the daemon or Mac
+  restarts. Missing journals and old non-app slots are pruned before the
+  keyboard is painted, preventing ghost keys.
 - A low-rate watchdog reasserts direct lighting mode after keyboard sleep or
   another lighting app takes control.
 - A newer task cannot displace an unacknowledged green, red, purple, or amber
@@ -221,6 +230,9 @@ Common causes:
 - Logitech G HUB may overwrite the indicator colours if it is running an active
   lighting effect.
 - Codex may ask you to trust the hook command after installation.
+- G1 through G5 intentionally ignore tasks started from Terminal, `codex exec`,
+  Claude Code, or another app. Use Codex Desktop when a task should appear on
+  the keyboard and be reopenable by pressing its G-key.
 - A terminal `task_complete` record repairs a missed `Stop` hook. An app-level
   failure that writes neither record can still leave the last blue state; use
   `codex-agent-indicator set error TASK_ID` to correct that rare case manually.
@@ -232,9 +244,13 @@ Common causes:
 - Everything runs locally on your Mac.
 - There is no telemetry, analytics, cloud service, or network server.
 - Hook messages travel through a private user-only Unix socket.
+- Every automatic hook is checked against the matching journal's bounded
+  metadata record. Only a top-level Codex Desktop task is admitted; unknown or
+  missing metadata fails closed.
 - The daemon follows only the local journals for tasks currently assigned to
-  G1 through G5. It scans at most the latest 8 MiB once after a restart, then
-  checks only for appended bytes every 250 ms.
+  G1 through G5. It reads at most 256 KiB to classify a journal, scans at most
+  the latest 8 MiB once after a restart, then checks only for appended bytes
+  every 250 ms.
 - It ignores non-lifecycle journal records and never stores journal content in
   its status file or logs.
 - The daemon does not poll Codex databases or processes and does not start a
@@ -255,11 +271,12 @@ The project is one small native Rust binary. It serves as:
 - the G-key task switcher;
 - the configuration and diagnostic command.
 
-Hooks send a small Unix datagram and exit. The daemon tracks task, turn, and
-subagent identity, batches lighting changes into one HID++ frame, debounces
-unchanged status-file writes, restores its last state after restarts, and sleeps
-between events. A bounded local-journal adapter reconciles native turn start and
-completion records when a hook is missed. A low-rate watchdog reclaims Logitech
+Hooks send a small Unix datagram and exit. The daemon verifies the task's
+persisted Codex Desktop origin, tracks task, turn, and child-agent identity,
+batches lighting changes into one HID++ frame, debounces unchanged status-file
+writes, restores only valid app tasks after restarts, and sleeps between events.
+A bounded local-journal adapter reconciles native turn start and completion
+records when a hook is missed. A low-rate watchdog reclaims Logitech
 direct-lighting mode. G-key presses use Logitech's HID++ `0x8010` feature. Task
 switching uses Codex's `codex://threads/<thread-id>` deep link.
 
@@ -277,8 +294,9 @@ cargo clippy --all-targets -- -D warnings
 
 Lifecycle replay tests use privacy-scrubbed, version-labelled Codex hook JSON
 and the matching official input schemas. A separate pinned Codex app fixture
-exercises native `task_started`/`task_complete` reconciliation, including a
-missed `Stop` and a newer active turn. Together they exercise the complete
+exercises origin admission and native `task_started`/`task_complete`
+reconciliation, including rejected CLI/other-app sessions, missing journals, a
+missed `Stop`, and a newer active turn. Together they exercise the complete
 adapter → lifecycle tracker → G-key slot path:
 
 ```sh
