@@ -18,6 +18,58 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const G_KEY_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const STATUS_WRITE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusWriteRequest {
+    None,
+    Deferred,
+    Immediate,
+}
+
+struct StatusPersistence {
+    deadline: Option<Instant>,
+}
+
+impl StatusPersistence {
+    fn new() -> Self {
+        Self { deadline: None }
+    }
+
+    fn note(&mut self, now: Instant, request: StatusWriteRequest) -> bool {
+        match request {
+            StatusWriteRequest::None => false,
+            StatusWriteRequest::Deferred => {
+                self.deadline
+                    .get_or_insert(now + STATUS_WRITE_DEBOUNCE_INTERVAL);
+                false
+            }
+            StatusWriteRequest::Immediate => {
+                self.deadline = None;
+                true
+            }
+        }
+    }
+
+    fn poll_interval(&self, now: Instant) -> Duration {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(SOCKET_POLL_INTERVAL)
+            .clamp(Duration::from_millis(1), SOCKET_POLL_INTERVAL)
+    }
+
+    fn take_if_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        self.deadline = None;
+        true
+    }
+
+    fn mark_flushed(&mut self) {
+        self.deadline = None;
+    }
+}
 
 struct FlashController {
     bright: bool,
@@ -133,15 +185,18 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut hardware = Hardware::new();
     hardware.connect(&config, &engine);
     write_status(&paths, &config, &engine, &hardware)?;
+    let mut status_persistence = StatusPersistence::new();
 
     let mut buffer = [0_u8; 8_192];
     loop {
-        let flash_poll = flash.poll_interval(Instant::now(), &config, &engine);
-        socket.set_read_timeout(Some(hardware.poll_interval(flash_poll)))?;
+        let now = Instant::now();
+        let flash_poll = flash.poll_interval(now, &config, &engine);
+        let status_poll = status_persistence.poll_interval(now);
+        socket.set_read_timeout(Some(hardware.poll_interval(flash_poll.min(status_poll))))?;
         match socket.recv(&mut buffer) {
             Ok(length) => match serde_json::from_slice::<EventMessage>(&buffer[..length]) {
                 Ok(message) => {
-                    let changed = handle_message(
+                    let status_write = handle_message(
                         message,
                         ReloadContext {
                             paths: &paths,
@@ -153,7 +208,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         &mut hardware,
                         &mut flash,
                     );
-                    if changed {
+                    if status_persistence.note(Instant::now(), status_write) {
                         write_status(&paths, &config, &engine, &hardware)?;
                     }
                 }
@@ -197,6 +252,7 @@ pub fn run(paths: Paths) -> Result<()> {
         }
         if navigation_status_changed {
             write_status(&paths, &config, &engine, &hardware)?;
+            status_persistence.mark_flushed();
         }
 
         if last_config_check.elapsed() >= CONFIG_CHECK_INTERVAL {
@@ -214,6 +270,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         config_modified = current_modified;
                         lifecycle.clear(None);
                         write_status(&paths, &config, &engine, &hardware)?;
+                        status_persistence.mark_flushed();
                     }
                     Err(error) => eprintln!("configuration reload rejected: {error:#}"),
                 }
@@ -223,6 +280,7 @@ pub fn run(paths: Paths) -> Result<()> {
         if hardware.retry_due() {
             hardware.connect(&config, &engine);
             write_status(&paths, &config, &engine, &hardware)?;
+            status_persistence.mark_flushed();
         }
 
         if let Some(frame) = flash.frame_if_due(Instant::now(), &config, &engine) {
@@ -234,6 +292,11 @@ pub fn run(paths: Paths) -> Result<()> {
         if lighting_watchdog.take_if_due(Instant::now(), reassert_interval)
             && hardware.reassert_direct_lighting(&config, &engine)
         {
+            write_status(&paths, &config, &engine, &hardware)?;
+            status_persistence.mark_flushed();
+        }
+
+        if status_persistence.take_if_due(Instant::now()) {
             write_status(&paths, &config, &engine, &hardware)?;
         }
     }
@@ -252,7 +315,7 @@ fn handle_message(
     lifecycle: &mut LifecycleTracker,
     hardware: &mut Hardware,
     flash: &mut FlashController,
-) -> bool {
+) -> StatusWriteRequest {
     let hook_state = lifecycle.state_for_event(&message, config);
     match message {
         EventMessage::Hook {
@@ -260,16 +323,24 @@ fn handle_message(
             ..
         } => {
             let Some(state) = hook_state else {
-                return false;
+                return StatusWriteRequest::None;
             };
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
             apply_state_change(config, engine, hardware, flash, &changes);
-            true
+            if changes.is_empty() {
+                StatusWriteRequest::Deferred
+            } else {
+                StatusWriteRequest::Immediate
+            }
         }
         EventMessage::Set { session_id, state } => {
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
             apply_state_change(config, engine, hardware, flash, &changes);
-            true
+            if changes.is_empty() {
+                StatusWriteRequest::Deferred
+            } else {
+                StatusWriteRequest::Immediate
+            }
         }
         EventMessage::Clear { session_id } => {
             lifecycle.clear(session_id.as_deref());
@@ -278,7 +349,11 @@ fn handle_message(
                 None => engine.clear_all(config),
             };
             apply_state_change(config, engine, hardware, flash, &changes);
-            true
+            if changes.is_empty() {
+                StatusWriteRequest::None
+            } else {
+                StatusWriteRequest::Immediate
+            }
         }
         EventMessage::Reload => {
             if let Err(error) =
@@ -289,7 +364,7 @@ fn handle_message(
                 lifecycle.clear(None);
                 *reload.config_modified = modified_at(&reload.paths.config);
             }
-            true
+            StatusWriteRequest::Immediate
         }
     }
 }
@@ -655,7 +730,9 @@ mod tests {
     use crate::config::AppConfig;
     use crate::state::{Engine, StateKind};
 
-    use super::{FlashController, LightingWatchdog};
+    use super::{
+        FlashController, LightingWatchdog, StatusPersistence, StatusWriteRequest,
+    };
 
     #[test]
     fn alternates_active_g_keys_between_dim_and_full_status_colours() {
@@ -699,5 +776,39 @@ mod tests {
         assert!(watchdog.take_if_due(start + interval, interval));
         assert!(!watchdog.take_if_due(start + interval + Duration::from_secs(1), interval));
         assert!(watchdog.take_if_due(start + interval * 2, interval));
+    }
+
+    #[test]
+    fn debounces_repeated_non_visible_status_updates() {
+        let start = Instant::now();
+        let mut persistence = StatusPersistence::new();
+
+        assert!(!persistence.note(start, StatusWriteRequest::Deferred));
+        assert!(!persistence.note(
+            start + Duration::from_millis(100),
+            StatusWriteRequest::Deferred,
+        ));
+        assert!(
+            !persistence.take_if_due(start + Duration::from_millis(249))
+        );
+        assert!(persistence.take_if_due(start + Duration::from_millis(250)));
+        assert!(
+            !persistence.take_if_due(start + Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn visible_status_update_flushes_immediately_and_cancels_debounce() {
+        let start = Instant::now();
+        let mut persistence = StatusPersistence::new();
+
+        assert!(!persistence.note(start, StatusWriteRequest::Deferred));
+        assert!(persistence.note(
+            start + Duration::from_millis(50),
+            StatusWriteRequest::Immediate,
+        ));
+        assert!(
+            !persistence.take_if_due(start + Duration::from_millis(500))
+        );
     }
 }
