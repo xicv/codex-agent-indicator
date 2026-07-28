@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
@@ -181,13 +182,18 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut last_config_check = Instant::now();
     let mut engine = restore_engine(&paths, config.behavior.max_sessions);
     let mut journals = JournalTracker::new(paths.codex_sessions.clone());
-    let restored_working = engine
+    let restored_sessions = engine
         .snapshot(&config)
         .into_iter()
-        .filter(|slot| slot.state == crate::state::StateKind::Working)
         .map(|slot| slot.session_id)
         .collect::<Vec<_>>();
-    for transition in journals.restore(restored_working, &config) {
+    let restored = journals.restore(restored_sessions, &config);
+    prune_unadmitted_sessions(
+        &mut engine,
+        &restored.admitted_sessions,
+        &config,
+    );
+    for transition in restored.transitions {
         engine.reconcile(
             &transition.session_id,
             transition.state,
@@ -371,14 +377,31 @@ fn handle_message(
 ) -> StatusWriteRequest {
     if let EventMessage::Hook {
         session_id,
-        transcript_path: Some(transcript_path),
+        hook_event_name,
+        transcript_path,
         ..
     } = &message
-        && let Err(error) = reload
-            .journals
-            .register_live(session_id, Path::new(transcript_path))
     {
-        reload.journals.record_error(format!("{error:#}"));
+        let admitted = match transcript_path {
+            Some(transcript_path) => match reload
+                .journals
+                .register_live(session_id, Path::new(transcript_path))
+            {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    reload.journals.record_error(format!("{error:#}"));
+                    false
+                }
+            },
+            None => false,
+        };
+        if !admitted {
+            lifecycle.clear(Some(session_id));
+            if hook_event_name == "SessionEnd" {
+                reload.journals.clear(Some(session_id));
+            }
+            return StatusWriteRequest::None;
+        }
     }
     let hook_state = lifecycle.state_for_event(&message, config);
     match message {
@@ -476,6 +499,22 @@ fn retain_journals_for_slots(
             .into_iter()
             .map(|slot| slot.session_id),
     );
+}
+
+fn prune_unadmitted_sessions(
+    engine: &mut Engine,
+    admitted_sessions: &HashSet<String>,
+    config: &AppConfig,
+) {
+    let stale_sessions = engine
+        .snapshot(config)
+        .into_iter()
+        .map(|slot| slot.session_id)
+        .filter(|session_id| !admitted_sessions.contains(session_id))
+        .collect::<Vec<_>>();
+    for session_id in stale_sessions {
+        engine.clear_session(&session_id, config);
+    }
 }
 
 fn apply_state_change(
@@ -839,14 +878,55 @@ pub fn epoch_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     use crate::config::AppConfig;
-    use crate::state::{Engine, StateKind};
+    use crate::state::{Engine, RestoredSlot, StateKind};
 
     use super::{
         FlashController, LightingWatchdog, StatusPersistence, StatusWriteRequest,
+        prune_unadmitted_sessions,
     };
+
+    #[test]
+    fn startup_prunes_ghost_and_non_app_slots_before_lighting_them() {
+        let config = AppConfig::default();
+        let mut engine = Engine::restore(
+            config.behavior.max_sessions,
+            vec![
+                RestoredSlot {
+                    slot: 1,
+                    session_id: "desktop-task".to_owned(),
+                    state: StateKind::Done,
+                    updated_at: 10,
+                },
+                RestoredSlot {
+                    slot: 2,
+                    session_id: "missing-ghost".to_owned(),
+                    state: StateKind::Working,
+                    updated_at: 11,
+                },
+                RestoredSlot {
+                    slot: 3,
+                    session_id: "cli-task".to_owned(),
+                    state: StateKind::Approval,
+                    updated_at: 12,
+                },
+            ],
+        );
+
+        prune_unadmitted_sessions(
+            &mut engine,
+            &HashSet::from(["desktop-task".to_owned()]),
+            &config,
+        );
+
+        let snapshot = engine.snapshot(&config);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].session_id, "desktop-task");
+        assert_eq!(snapshot[0].state, StateKind::Done);
+    }
 
     #[test]
     fn alternates_active_g_keys_between_dim_and_full_status_colours() {
