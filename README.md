@@ -11,11 +11,11 @@ Use the five G-keys on a Logitech G915 keyboard as a live Codex task monitor.
 
 | Colour | Status |
 | --- | --- |
-| Blue | Codex is working |
-| Amber | Codex needs approval |
-| Purple | Codex needs your input |
-| Green | Codex finished successfully |
-| Red | Codex stopped with an error |
+| 🔵 Blue | Codex is working |
+| 🟠 Amber | Codex needs approval |
+| 🟣 Purple | Codex needs your input |
+| 🟢 Green | Codex finished successfully |
+| 🔴 Red | Codex stopped with an error |
 
 G1 through G5 each represent one Codex task. Active keys flash brightly while
 the rest of the keyboard stays on with a dim, steady background.
@@ -48,16 +48,28 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.3 --locked
+cargo install codex-agent-indicator --version 0.4.4 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
 does not add Codex hooks or create the macOS LaunchAgent.
 
-To upgrade or reinstall the same version:
+After installation, update to the latest published release with:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.3 --locked --force
+codex-agent-indicator update
+```
+
+The updater uses Cargo to replace the binary in its current install root. This
+means a complete `~/.local/bin` setup stays in `~/.local/bin` instead of gaining
+a second copy in `~/.cargo/bin`. It preserves your configuration and hooks, and
+restarts the keyboard indicator service when it was installed by the complete
+setup below.
+
+To reinstall a specific version instead:
+
+```sh
+cargo install codex-agent-indicator --version 0.4.4 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -116,6 +128,7 @@ Useful commands:
 codex-agent-indicator status
 codex-agent-indicator doctor
 codex-agent-indicator reload
+codex-agent-indicator update
 ```
 
 You can also preview or clear states manually:
@@ -130,7 +143,7 @@ codex-agent-indicator clear
 If your shell cannot find the command, add this to your shell profile:
 
 ```sh
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 ```
 
 ## Customize the lights
