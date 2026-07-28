@@ -40,6 +40,25 @@ brew install jq
 
 ## Install
 
+### Install the CLI from crates.io
+
+Install the published command-line binary:
+
+```sh
+cargo install codex-agent-indicator --version 0.4.0 --locked
+```
+
+Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
+does not add Codex hooks or create the macOS LaunchAgent.
+
+To upgrade or reinstall the same version:
+
+```sh
+cargo install codex-agent-indicator --version 0.4.0 --locked --force
+```
+
+### Complete keyboard-monitor setup
+
 Clone or download this repository, open Terminal in its folder, and run:
 
 ```sh
@@ -64,14 +83,9 @@ After the first install, open `/hooks` in Codex and trust this command:
 
 You do not need to restart Codex.
 
-To install only the command-line binary from crates.io:
-
-```sh
-cargo install codex-agent-indicator --version 0.4.0 --locked
-```
-
-The repository installer is still recommended because it also configures the
-Codex hooks and macOS LaunchAgent.
+The complete installer builds the same version from the checked-out source and
+is recommended for first-time setup because it also configures the Codex hooks
+and macOS LaunchAgent.
 
 ## Uninstall
 
@@ -113,7 +127,7 @@ codex-agent-indicator clear
 If your shell cannot find the command, add this to your shell profile:
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 ```
 
 ## Customize the lights
