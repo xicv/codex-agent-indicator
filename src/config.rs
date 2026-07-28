@@ -280,6 +280,7 @@ impl Default for EventConfig {
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub config: PathBuf,
+    pub codex_sessions: PathBuf,
     pub runtime_dir: PathBuf,
     pub socket: PathBuf,
     pub status: PathBuf,
@@ -289,6 +290,9 @@ impl Paths {
     pub fn discover() -> Result<Self> {
         let home = env::var_os("HOME").context("HOME is not set")?;
         let home = PathBuf::from(home);
+        let codex_home = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
         let config = env::var_os("CODEX_AGENT_INDICATOR_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -300,6 +304,7 @@ impl Paths {
 
         Ok(Self {
             config,
+            codex_sessions: codex_home.join("sessions"),
             socket: runtime_dir.join("indicator.sock"),
             status: runtime_dir.join("status.json"),
             runtime_dir,

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, Paths};
 use crate::device::G915;
+use crate::journal::{JournalTracker, SessionJournalTransition};
 use crate::navigation::open_codex_thread;
 use crate::state::{Engine, LightingChange, RestoredSlot};
 use crate::wire::{EventMessage, LifecycleTracker};
@@ -179,12 +180,27 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut config_modified = modified_at(&paths.config);
     let mut last_config_check = Instant::now();
     let mut engine = restore_engine(&paths, config.behavior.max_sessions);
+    let mut journals = JournalTracker::new(paths.codex_sessions.clone());
+    let restored_working = engine
+        .snapshot(&config)
+        .into_iter()
+        .filter(|slot| slot.state == crate::state::StateKind::Working)
+        .map(|slot| slot.session_id)
+        .collect::<Vec<_>>();
+    for transition in journals.restore(restored_working, &config) {
+        engine.reconcile(
+            &transition.session_id,
+            transition.state,
+            transition.occurred_at,
+            &config,
+        );
+    }
     let mut lifecycle = LifecycleTracker::default();
     let mut flash = FlashController::new();
     let mut lighting_watchdog = LightingWatchdog::new();
     let mut hardware = Hardware::new();
     hardware.connect(&config, &engine);
-    write_status(&paths, &config, &engine, &hardware)?;
+    write_status(&paths, &config, &engine, &hardware, &journals)?;
     let mut status_persistence = StatusPersistence::new();
 
     let mut buffer = [0_u8; 8_192];
@@ -192,7 +208,10 @@ pub fn run(paths: Paths) -> Result<()> {
         let now = Instant::now();
         let flash_poll = flash.poll_interval(now, &config, &engine);
         let status_poll = status_persistence.poll_interval(now);
-        socket.set_read_timeout(Some(hardware.poll_interval(flash_poll.min(status_poll))))?;
+        let journal_poll = journals.poll_interval(now);
+        socket.set_read_timeout(Some(
+            hardware.poll_interval(flash_poll.min(status_poll).min(journal_poll)),
+        ))?;
         match socket.recv(&mut buffer) {
             Ok(length) => match serde_json::from_slice::<EventMessage>(&buffer[..length]) {
                 Ok(message) => {
@@ -201,6 +220,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         ReloadContext {
                             paths: &paths,
                             config_modified: &mut config_modified,
+                            journals: &mut journals,
                         },
                         &mut config,
                         &mut engine,
@@ -209,7 +229,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         &mut flash,
                     );
                     if status_persistence.note(Instant::now(), status_write) {
-                        write_status(&paths, &config, &engine, &hardware)?;
+                        write_status(&paths, &config, &engine, &hardware, &journals)?;
                     }
                 }
                 Err(error) => {
@@ -251,7 +271,33 @@ pub fn run(paths: Paths) -> Result<()> {
             }
         }
         if navigation_status_changed {
-            write_status(&paths, &config, &engine, &hardware)?;
+            journals.retain_sessions(
+                engine
+                    .snapshot(&config)
+                    .into_iter()
+                    .map(|slot| slot.session_id),
+            );
+            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_persistence.mark_flushed();
+        }
+
+        let previous_journal_error = journals.last_error().clone();
+        let transitions = journals.poll_if_due(Instant::now(), &config);
+        for transition in &transitions {
+            lifecycle.clear(Some(&transition.session_id));
+        }
+        let status_write = apply_journal_transitions(
+            transitions,
+            &config,
+            &mut engine,
+            &mut hardware,
+            &mut flash,
+        );
+        if status_persistence.note(Instant::now(), status_write) {
+            write_status(&paths, &config, &engine, &hardware, &journals)?;
+        }
+        if previous_journal_error != *journals.last_error() {
+            write_status(&paths, &config, &engine, &hardware, &journals)?;
             status_persistence.mark_flushed();
         }
 
@@ -269,7 +315,13 @@ pub fn run(paths: Paths) -> Result<()> {
                     Ok(()) => {
                         config_modified = current_modified;
                         lifecycle.clear(None);
-                        write_status(&paths, &config, &engine, &hardware)?;
+                        journals.retain_sessions(
+                            engine
+                                .snapshot(&config)
+                                .into_iter()
+                                .map(|slot| slot.session_id),
+                        );
+                        write_status(&paths, &config, &engine, &hardware, &journals)?;
                         status_persistence.mark_flushed();
                     }
                     Err(error) => eprintln!("configuration reload rejected: {error:#}"),
@@ -279,7 +331,7 @@ pub fn run(paths: Paths) -> Result<()> {
 
         if hardware.retry_due() {
             hardware.connect(&config, &engine);
-            write_status(&paths, &config, &engine, &hardware)?;
+            write_status(&paths, &config, &engine, &hardware, &journals)?;
             status_persistence.mark_flushed();
         }
 
@@ -292,12 +344,12 @@ pub fn run(paths: Paths) -> Result<()> {
         if lighting_watchdog.take_if_due(Instant::now(), reassert_interval)
             && hardware.reassert_direct_lighting(&config, &engine)
         {
-            write_status(&paths, &config, &engine, &hardware)?;
+            write_status(&paths, &config, &engine, &hardware, &journals)?;
             status_persistence.mark_flushed();
         }
 
         if status_persistence.take_if_due(Instant::now()) {
-            write_status(&paths, &config, &engine, &hardware)?;
+            write_status(&paths, &config, &engine, &hardware, &journals)?;
         }
     }
 }
@@ -305,6 +357,7 @@ pub fn run(paths: Paths) -> Result<()> {
 struct ReloadContext<'a> {
     paths: &'a Paths,
     config_modified: &'a mut Option<SystemTime>,
+    journals: &'a mut JournalTracker,
 }
 
 fn handle_message(
@@ -316,6 +369,17 @@ fn handle_message(
     hardware: &mut Hardware,
     flash: &mut FlashController,
 ) -> StatusWriteRequest {
+    if let EventMessage::Hook {
+        session_id,
+        transcript_path: Some(transcript_path),
+        ..
+    } = &message
+        && let Err(error) = reload
+            .journals
+            .register_live(session_id, Path::new(transcript_path))
+    {
+        reload.journals.record_error(format!("{error:#}"));
+    }
     let hook_state = lifecycle.state_for_event(&message, config);
     match message {
         EventMessage::Hook {
@@ -323,10 +387,12 @@ fn handle_message(
             ..
         } => {
             let Some(state) = hook_state else {
+                retain_journals_for_slots(reload.journals, engine, config);
                 return StatusWriteRequest::None;
             };
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
             apply_state_change(config, engine, hardware, flash, &changes);
+            retain_journals_for_slots(reload.journals, engine, config);
             if changes.is_empty() {
                 StatusWriteRequest::Deferred
             } else {
@@ -336,6 +402,7 @@ fn handle_message(
         EventMessage::Set { session_id, state } => {
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
             apply_state_change(config, engine, hardware, flash, &changes);
+            retain_journals_for_slots(reload.journals, engine, config);
             if changes.is_empty() {
                 StatusWriteRequest::Deferred
             } else {
@@ -344,6 +411,7 @@ fn handle_message(
         }
         EventMessage::Clear { session_id } => {
             lifecycle.clear(session_id.as_deref());
+            reload.journals.clear(session_id.as_deref());
             let changes = match session_id {
                 Some(session_id) => engine.clear_session(&session_id, config),
                 None => engine.clear_all(config),
@@ -364,9 +432,50 @@ fn handle_message(
                 lifecycle.clear(None);
                 *reload.config_modified = modified_at(&reload.paths.config);
             }
+            retain_journals_for_slots(reload.journals, engine, config);
             StatusWriteRequest::Immediate
         }
     }
+}
+
+fn apply_journal_transitions(
+    transitions: Vec<SessionJournalTransition>,
+    config: &AppConfig,
+    engine: &mut Engine,
+    hardware: &mut Hardware,
+    flash: &mut FlashController,
+) -> StatusWriteRequest {
+    if transitions.is_empty() {
+        return StatusWriteRequest::None;
+    }
+    let mut changes = Vec::new();
+    for transition in transitions {
+        changes.extend(engine.reconcile(
+            &transition.session_id,
+            transition.state,
+            transition.occurred_at,
+            config,
+        ));
+    }
+    apply_state_change(config, engine, hardware, flash, &changes);
+    if changes.is_empty() {
+        StatusWriteRequest::Deferred
+    } else {
+        StatusWriteRequest::Immediate
+    }
+}
+
+fn retain_journals_for_slots(
+    journals: &mut JournalTracker,
+    engine: &Engine,
+    config: &AppConfig,
+) {
+    journals.retain_sessions(
+        engine
+            .snapshot(config)
+            .into_iter()
+            .map(|slot| slot.session_id),
+    );
 }
 
 fn apply_state_change(
@@ -639,6 +748,8 @@ struct DaemonStatus<'a> {
     g_key_navigation_enabled: bool,
     g_key_navigation_active: bool,
     last_navigation_error: &'a Option<String>,
+    lifecycle_sources: usize,
+    last_lifecycle_error: &'a Option<String>,
     slots: Vec<crate::state::SlotSnapshot>,
 }
 
@@ -677,6 +788,7 @@ fn write_status(
     config: &AppConfig,
     engine: &Engine,
     hardware: &Hardware,
+    journals: &JournalTracker,
 ) -> Result<()> {
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -690,6 +802,8 @@ fn write_status(
             .as_ref()
             .is_some_and(G915::g_key_navigation_active),
         last_navigation_error: &hardware.last_navigation_error,
+        lifecycle_sources: journals.source_count(),
+        last_lifecycle_error: journals.last_error(),
         slots: engine.snapshot(config),
     };
     let content = serde_json::to_vec_pretty(&status)?;

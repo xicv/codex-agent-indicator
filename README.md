@@ -48,7 +48,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.2 --locked
+cargo install codex-agent-indicator --version 0.4.3 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -57,7 +57,7 @@ does not add Codex hooks or create the macOS LaunchAgent.
 To upgrade or reinstall the same version:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.2 --locked --force
+cargo install codex-agent-indicator --version 0.4.3 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -172,6 +172,9 @@ error = "#ff3b30"
 - The first five active Codex tasks use G1 through G5.
 - Parent turns and subagents are tracked separately, so a child finishing
   cannot turn the parent task green early.
+- Fast hooks are reconciled against the known task's local `task_started` and
+  `task_complete` journal records. A missed terminal hook therefore corrects
+  itself within about 250 ms instead of leaving a stale blue key.
 - Permission and user-input states take priority over unrelated subagent
   activity.
 - A failed individual tool remains blue while Codex handles it; red is reserved
@@ -205,10 +208,9 @@ Common causes:
 - Logitech G HUB may overwrite the indicator colours if it is running an active
   lighting effect.
 - Codex may ask you to trust the hook command after installation.
-- Codex does not currently emit a terminal `Stop` hook for every app-level
-  system failure, such as model-capacity errors. The last blue state can remain
-  until the next lifecycle event; use `codex-agent-indicator set error TASK_ID`
-  to correct it manually.
+- A terminal `task_complete` record repairs a missed `Stop` hook. An app-level
+  failure that writes neither record can still leave the last blue state; use
+  `codex-agent-indicator set error TASK_ID` to correct that rare case manually.
 - The daemon log is stored at
   `~/Library/Logs/codex-agent-indicator.log`.
 
@@ -217,8 +219,13 @@ Common causes:
 - Everything runs locally on your Mac.
 - There is no telemetry, analytics, cloud service, or network server.
 - Hook messages travel through a private user-only Unix socket.
-- The daemon does not read task transcripts.
-- The daemon does not poll Codex databases, processes, or a second app-server.
+- The daemon follows only the local journals for tasks currently assigned to
+  G1 through G5. It scans at most the latest 8 MiB once after a restart, then
+  checks only for appended bytes every 250 ms.
+- It ignores non-lifecycle journal records and never stores journal content in
+  its status file or logs.
+- The daemon does not poll Codex databases or processes and does not start a
+  second app-server.
 - Only the tail of a final assistant message is inspected to distinguish a
   question from a completed response.
 - No Accessibility permission, screen recording, browser control, MCP server,
@@ -238,9 +245,10 @@ The project is one small native Rust binary. It serves as:
 Hooks send a small Unix datagram and exit. The daemon tracks task, turn, and
 subagent identity, batches lighting changes into one HID++ frame, debounces
 unchanged status-file writes, restores its last state after restarts, and sleeps
-between events. A low-rate watchdog reclaims Logitech direct-lighting mode
-without polling Codex. G-key presses use Logitech's HID++ `0x8010` feature.
-Task switching uses Codex's `codex://threads/<thread-id>` deep link.
+between events. A bounded local-journal adapter reconciles native turn start and
+completion records when a hook is missed. A low-rate watchdog reclaims Logitech
+direct-lighting mode. G-key presses use Logitech's HID++ `0x8010` feature. Task
+switching uses Codex's `codex://threads/<thread-id>` deep link.
 
 Only live RGB output and G-key notification diversion are controlled while the
 daemon runs. The program does not edit G HUB macros, profiles, key assignments,
@@ -255,11 +263,14 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Lifecycle replay tests use privacy-scrubbed, version-labelled Codex hook JSON
-and the matching official input schemas. They exercise the complete adapter →
-lifecycle tracker → G-key slot path:
+and the matching official input schemas. A separate pinned Codex app fixture
+exercises native `task_started`/`task_complete` reconciliation, including a
+missed `Stop` and a newer active turn. Together they exercise the complete
+adapter → lifecycle tracker → G-key slot path:
 
 ```sh
 cargo test wire::replay_tests
+cargo test journal::tests
 ```
 
 When the Codex hook schema changes, add a new fixture snapshot instead of

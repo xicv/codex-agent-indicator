@@ -149,6 +149,22 @@ impl Engine {
         }
     }
 
+    pub fn reconcile(
+        &mut self,
+        session_id: &str,
+        state: StateKind,
+        occurred_at: u64,
+        config: &AppConfig,
+    ) -> Vec<LightingChange> {
+        let updated_at = self
+            .slots
+            .iter()
+            .filter_map(Option::as_ref)
+            .find(|slot| slot.session_id == session_id)
+            .map_or(occurred_at, |slot| slot.updated_at.max(occurred_at));
+        self.transition(session_id, state, updated_at, config)
+    }
+
     pub fn clear_session(
         &mut self,
         session_id: &str,
@@ -469,5 +485,18 @@ mod tests {
         assert_eq!(snapshot[0].slot, 2);
         assert_eq!(snapshot[0].session_id, "working-task");
         assert_eq!(snapshot[0].state, StateKind::Working);
+    }
+
+    #[test]
+    fn reconciliation_changes_truth_without_regressing_event_recency() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(5);
+        engine.transition("task", StateKind::Working, 200, &config);
+
+        engine.reconcile("task", StateKind::Done, 150, &config);
+
+        let snapshot = engine.snapshot(&config);
+        assert_eq!(snapshot[0].state, StateKind::Done);
+        assert_eq!(snapshot[0].updated_at, 200);
     }
 }

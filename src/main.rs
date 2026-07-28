@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod device;
+mod journal;
 mod navigation;
 mod protocol;
 mod state;
@@ -20,11 +21,6 @@ use wire::{EventMessage, HookInput};
 
 fn main() -> ExitCode {
     let command = env::args().nth(1).unwrap_or_else(|| "help".to_string());
-    if command == "hook" {
-        let _ = forward_hook();
-        return ExitCode::SUCCESS;
-    }
-
     match run_command(&command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -37,6 +33,7 @@ fn main() -> ExitCode {
 fn run_command(command: &str) -> Result<()> {
     match command {
         "daemon" => daemon::run(Paths::discover()?),
+        "hook" => forward_hook(),
         "init-config" => init_config(env::args().any(|argument| argument == "--force")),
         "set" => set_state(),
         "clear" => clear_state(),

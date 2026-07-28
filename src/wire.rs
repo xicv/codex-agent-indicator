@@ -19,6 +19,7 @@ pub enum EventMessage {
         tool_name: Option<String>,
         last_assistant_message: Option<String>,
         tool_failed: bool,
+        transcript_path: Option<String>,
     },
     Set {
         session_id: String,
@@ -46,6 +47,8 @@ pub struct HookInput {
     pub last_assistant_message: Option<String>,
     #[serde(default)]
     pub tool_response: Option<Value>,
+    #[serde(default)]
+    pub transcript_path: Option<String>,
 }
 
 impl HookInput {
@@ -75,6 +78,7 @@ impl HookInput {
                 .as_deref()
                 .map(message_tail),
             tool_failed: self.tool_response.as_ref().is_some_and(tool_failed),
+            transcript_path: self.transcript_path,
         }
     }
 }
@@ -104,6 +108,7 @@ impl LifecycleTracker {
             tool_name,
             last_assistant_message,
             tool_failed,
+            ..
         } = event
         else {
             return None;
@@ -301,7 +306,7 @@ pub fn assistant_message_reports_failure(message: &str) -> bool {
     .any(|phrase| lowercase.contains(phrase))
 }
 
-fn message_tail(message: &str) -> String {
+pub(crate) fn message_tail(message: &str) -> String {
     if message.len() <= MAX_MESSAGE_TAIL_BYTES {
         return message.to_string();
     }
@@ -362,6 +367,7 @@ mod tests {
             tool_name: None,
             last_assistant_message: None,
             tool_failed: false,
+            transcript_path: None,
         }
     }
 
@@ -428,6 +434,25 @@ mod tests {
                 tool_name: Some(tool_name),
                 ..
             } if run_id == "child" && tool_name == "exec"
+        ));
+    }
+
+    #[test]
+    fn preserves_the_official_transcript_path_for_lifecycle_reconciliation() {
+        let input: HookInput = serde_json::from_value(json!({
+            "session_id": "task",
+            "turn_id": "root-turn",
+            "hook_event_name": "UserPromptSubmit",
+            "transcript_path": "/tmp/privacy-scrubbed-task.jsonl"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            input.into_event(),
+            EventMessage::Hook {
+                transcript_path: Some(path),
+                ..
+            } if path == "/tmp/privacy-scrubbed-task.jsonl"
         ));
     }
 
