@@ -174,6 +174,14 @@ done = "#34c759"
 error = "#ff3b30"
 ```
 
+- Change `background` to control the steady light on every non-indicator key
+  and every unoccupied G-key. It does not change active G1-G5 status colours.
+  Useful six-digit RGB values are:
+
+  - `#101820` — very dim;
+  - `#202c38` — readable in a dark room;
+  - `#304050` — brighter.
+
 - Increase `flash_interval_ms` for slower flashing.
 - Increase `flash_dim_percent` for a brighter dim phase.
 - Set `flash_enabled = false` for steady status colours.
