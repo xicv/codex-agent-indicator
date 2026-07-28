@@ -21,8 +21,9 @@ G1 through G5 each represent one Codex task. Active keys flash brightly while
 the rest of the keyboard stays on with a dim, steady background.
 
 Green, red, purple, and amber stay visible until you press their G-key. The key
-opens the matching task in Codex and then clears the acknowledged light. A blue
-key stays blue because its task is still working.
+brings Codex to the foreground, selects the matching task in its sidebar, and
+then clears the acknowledged light. A blue key stays blue because its task is
+still working.
 
 ## Requirements
 
@@ -89,7 +90,8 @@ custom configuration is kept. To remove that too:
 
 ## Use it
 
-Press an illuminated G-key to open its matching Codex task.
+Press an illuminated G-key to bring Codex forward and select its matching task
+in the sidebar.
 
 Useful commands:
 
@@ -155,6 +157,8 @@ error = "#ff3b30"
 - If all five keys need acknowledgement, open one before another task can be
   assigned.
 - The oldest blue working slot may be reused when all keys are occupied.
+- G-key navigation explicitly targets the Codex app, brings it to the
+  foreground, and selects the task through its local deep link.
 - A task is acknowledged only after its Codex deep link opens successfully.
 - Merely ending a Codex process does not clear an unacknowledged result.
 
