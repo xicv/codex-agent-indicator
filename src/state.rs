@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -67,11 +68,43 @@ pub struct Engine {
     slots: Vec<Option<Slot>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RestoredSlot {
+    pub slot: usize,
+    pub session_id: String,
+    pub state: StateKind,
+    pub updated_at: u64,
+}
+
 impl Engine {
     pub fn new(max_sessions: usize) -> Self {
         Self {
             slots: vec![None; max_sessions],
         }
+    }
+
+    pub fn restore(max_sessions: usize, slots: Vec<RestoredSlot>) -> Self {
+        let mut engine = Self::new(max_sessions);
+        let mut restored_sessions = HashSet::new();
+        for restored in slots {
+            let Some(index) = restored.slot.checked_sub(1) else {
+                continue;
+            };
+            if index >= max_sessions
+                || restored.session_id.is_empty()
+                || restored.state == StateKind::Idle
+                || engine.slots[index].is_some()
+                || !restored_sessions.insert(restored.session_id.clone())
+            {
+                continue;
+            }
+            engine.slots[index] = Some(Slot {
+                session_id: restored.session_id,
+                state: restored.state,
+                updated_at: restored.updated_at,
+            });
+        }
+        engine
     }
 
     pub fn transition(
@@ -268,7 +301,7 @@ pub struct SlotSnapshot {
 mod tests {
     use crate::config::{AppConfig, Color};
 
-    use super::{Engine, StateKind};
+    use super::{Engine, RestoredSlot, StateKind};
 
     #[test]
     fn assigns_and_reuses_a_slot() {
@@ -396,5 +429,45 @@ mod tests {
         assert_eq!(engine.session_for_g_key(3), None);
         assert_eq!(engine.session_for_g_key(0), None);
         assert_eq!(engine.session_for_g_key(6), None);
+    }
+
+    #[test]
+    fn restores_persisted_slots_without_accepting_duplicates_or_invalid_entries() {
+        let config = AppConfig::default();
+        let engine = Engine::restore(
+            5,
+            vec![
+                RestoredSlot {
+                    slot: 2,
+                    session_id: "working-task".to_owned(),
+                    state: StateKind::Working,
+                    updated_at: 20,
+                },
+                RestoredSlot {
+                    slot: 3,
+                    session_id: "working-task".to_owned(),
+                    state: StateKind::Done,
+                    updated_at: 21,
+                },
+                RestoredSlot {
+                    slot: 6,
+                    session_id: "out-of-range".to_owned(),
+                    state: StateKind::Error,
+                    updated_at: 22,
+                },
+                RestoredSlot {
+                    slot: 4,
+                    session_id: String::new(),
+                    state: StateKind::Approval,
+                    updated_at: 23,
+                },
+            ],
+        );
+
+        let snapshot = engine.snapshot(&config);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].slot, 2);
+        assert_eq!(snapshot[0].session_id, "working-task");
+        assert_eq!(snapshot[0].state, StateKind::Working);
     }
 }
