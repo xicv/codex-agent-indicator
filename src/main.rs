@@ -5,6 +5,7 @@ mod journal;
 mod navigation;
 mod protocol;
 mod state;
+mod update;
 mod wire;
 
 use std::env;
@@ -40,6 +41,7 @@ fn run_command(command: &str) -> Result<()> {
         "reload" => send_event(&Paths::discover()?, &EventMessage::Reload),
         "status" => print_status(),
         "doctor" => doctor(),
+        "update" => update::run(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -183,6 +185,7 @@ USAGE:
     codex-agent-indicator reload
     codex-agent-indicator status
     codex-agent-indicator doctor
+    codex-agent-indicator update
     codex-agent-indicator init-config [--force]
 
 STATES:
