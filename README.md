@@ -45,7 +45,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.0 --locked
+cargo install codex-agent-indicator --version 0.4.1 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -54,7 +54,7 @@ does not add Codex hooks or create the macOS LaunchAgent.
 To upgrade or reinstall the same version:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.0 --locked --force
+cargo install codex-agent-indicator --version 0.4.1 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
