@@ -17,7 +17,7 @@
         <false/>
     </dict>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
     <key>LowPriorityIO</key>
     <true/>
     <key>StandardOutPath</key>

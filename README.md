@@ -51,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.7 --locked
+cargo install codex-agent-indicator --version 0.4.8 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.7 --locked --force
+cargo install codex-agent-indicator --version 0.4.8 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -279,6 +279,9 @@ Common causes:
   its status file or logs.
 - The daemon does not poll Codex databases or processes and does not start a
   second app-server.
+- The LaunchAgent uses macOS's interactive scheduling class because it handles
+  physical G-key presses. It remains event-driven, keeps filesystem I/O at low
+  priority, and normally uses only a small fraction of one CPU core.
 - Only the tail of a final assistant message is inspected to distinguish a
   question from a completed response.
 - No Accessibility permission, screen recording, browser control, MCP server,
