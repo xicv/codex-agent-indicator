@@ -51,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.5 --locked
+cargo install codex-agent-indicator --version 0.4.6 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.5 --locked --force
+cargo install codex-agent-indicator --version 0.4.6 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
