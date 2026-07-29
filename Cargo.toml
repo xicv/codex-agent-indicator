@@ -1,6 +1,6 @@
 [package]
 name = "codex-agent-indicator"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 rust-version = "1.91"
 description = "Low-overhead Codex task status indicator for Logitech G915 G-keys"

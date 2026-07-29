@@ -51,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.8 --locked
+cargo install codex-agent-indicator --version 0.4.9 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.8 --locked --force
+cargo install codex-agent-indicator --version 0.4.9 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -214,6 +214,8 @@ error = "#ff3b30"
 - Current Codex Desktop task lights are restored after the daemon or Mac
   restarts. Missing journals and old non-app slots are pruned before the
   keyboard is painted, preventing ghost keys.
+- A second daemon exits without removing the active daemon's socket, preventing
+  duplicate processes from competing for keyboard lighting and G-key presses.
 - A low-rate watchdog reasserts direct lighting mode after keyboard sleep or
   another lighting app takes control.
 - Status-cache write failures are recorded without stopping live lighting or
