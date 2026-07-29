@@ -23,9 +23,9 @@ background = "#101820"
 # Active G-keys alternate between their full state colour and this percentage.
 flash_enabled = true
 flash_interval_ms = 500
-flash_dim_percent = 5
+flash_dim_percent = 20
 # Reclaim direct lighting mode after keyboard sleep or another lighting app.
-reassert_interval_ms = 5000
+reassert_interval_ms = 2000
 
 [navigation]
 # Press an occupied G1-G5 key to open its mapped Codex task.

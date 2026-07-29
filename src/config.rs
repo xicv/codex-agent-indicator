@@ -209,8 +209,8 @@ impl Default for LightingConfig {
             background: "#101820".parse().expect("valid color"),
             flash_enabled: true,
             flash_interval_ms: 500,
-            flash_dim_percent: 5,
-            reassert_interval_ms: 5_000,
+            flash_dim_percent: 20,
+            reassert_interval_ms: 2_000,
         }
     }
 }
@@ -321,6 +321,8 @@ mod tests {
         let config: AppConfig = toml::from_str(DEFAULT_CONFIG).unwrap();
         config.validate().unwrap();
         assert_eq!(config.device.slot_keys, [0xb4, 0xb5, 0xb6, 0xb7, 0xb8]);
+        assert_eq!(config.lighting.flash_dim_percent, 20);
+        assert_eq!(config.lighting.reassert_interval_ms, 2_000);
         assert!(config.navigation.enabled);
         assert_eq!(config.events.post_tool_failure, crate::state::StateKind::Working);
     }
