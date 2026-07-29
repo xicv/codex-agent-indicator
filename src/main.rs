@@ -14,6 +14,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use config::{AppConfig, DEFAULT_CONFIG, Paths};
@@ -121,6 +123,10 @@ fn init_config(force: bool) -> Result<()> {
 
 fn print_status() -> Result<()> {
     let paths = Paths::discover()?;
+    let previous_modified = modified_at(&paths.status);
+    if send_event(&paths, &EventMessage::Snapshot).is_ok() {
+        wait_for_status_refresh(&paths.status, previous_modified);
+    }
     let content = fs::read_to_string(&paths.status).with_context(|| {
         format!(
             "no daemon status at {}; the daemon may not be running",
@@ -129,6 +135,22 @@ fn print_status() -> Result<()> {
     })?;
     println!("{content}");
     Ok(())
+}
+
+fn wait_for_status_refresh(path: &std::path::Path, previous_modified: Option<SystemTime>) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if modified_at(path) != previous_modified {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn modified_at(path: &std::path::Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 fn doctor() -> Result<()> {

@@ -29,6 +29,7 @@ pub enum EventMessage {
         session_id: Option<String>,
     },
     Reload,
+    Snapshot,
 }
 
 #[derive(Debug, Deserialize)]

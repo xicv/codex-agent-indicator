@@ -51,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.6 --locked
+cargo install codex-agent-indicator --version 0.4.7 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.6 --locked --force
+cargo install codex-agent-indicator --version 0.4.7 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -165,7 +165,7 @@ background = "#101820"
 flash_enabled = true
 flash_interval_ms = 500
 flash_dim_percent = 20
-reassert_interval_ms = 2000
+reassert_interval_ms = 1000
 
 [colors]
 working = "#007aff"
@@ -187,8 +187,9 @@ error = "#ff3b30"
 - Keep `flash_dim_percent` above zero so a delayed background process cannot
   leave active indicators looking completely dark.
 - Set `flash_enabled = false` for steady status colours.
-- Increase `reassert_interval_ms` if you want less frequent direct-lighting
-  watchdog refreshes.
+- Keep `reassert_interval_ms = 1000` for the fastest supported recovery when
+  G HUB or another lighting app takes control. Increase it for less frequent
+  direct-lighting watchdog refreshes.
 - Set `navigation.enabled = false` if G-keys should show status without opening
   tasks.
 - Set `detect_questions = false` to treat every stopped turn as completed.
@@ -218,6 +219,13 @@ error = "#ff3b30"
 - Status-cache write failures are recorded without stopping live lighting or
   G-key navigation. The daemon reports the last status-write and G915 failures
   after recovery so intermittent outages remain diagnosable.
+- `codex-agent-indicator status` also reports successful lighting reassertion
+  count/timing and event-loop delays of at least 250 ms. Routine successful
+  reassertions stay quiet and do not force additional status-file writes;
+  repeated loop-delay logs and writes are limited to once every 30 seconds.
+- The `status` command asks the daemon for a fresh, state-neutral snapshot
+  before reading the local cache, so diagnostics are current without adding
+  background polling.
 - A newer task cannot displace an unacknowledged green, red, purple, or amber
   state.
 - If all five keys need acknowledgement, open one before another task can be
@@ -251,7 +259,9 @@ Common causes:
   `codex-agent-indicator set error TASK_ID` to correct that rare case manually.
 - The daemon log is stored at
   `~/Library/Logs/codex-agent-indicator.log`. Hardware and persistence recovery
-  events include Unix timestamps.
+  events include Unix timestamps. `event-loop-delay` identifies CPU scheduling
+  or slow local work; a recent successful lighting reassertion with no loop,
+  HID, or persistence failure points to another lighting app taking control.
 
 ## Privacy and performance
 

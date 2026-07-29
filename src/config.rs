@@ -210,7 +210,7 @@ impl Default for LightingConfig {
             flash_enabled: true,
             flash_interval_ms: 500,
             flash_dim_percent: 20,
-            reassert_interval_ms: 2_000,
+            reassert_interval_ms: 1_000,
         }
     }
 }
@@ -322,7 +322,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.device.slot_keys, [0xb4, 0xb5, 0xb6, 0xb7, 0xb8]);
         assert_eq!(config.lighting.flash_dim_percent, 20);
-        assert_eq!(config.lighting.reassert_interval_ms, 2_000);
+        assert_eq!(config.lighting.reassert_interval_ms, 1_000);
         assert!(config.navigation.enabled);
         assert_eq!(config.events.post_tool_failure, crate::state::StateKind::Working);
     }
