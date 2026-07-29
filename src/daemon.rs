@@ -73,6 +73,62 @@ impl StatusPersistence {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ObservedFailure {
+    occurred_at: u64,
+    message: String,
+}
+
+struct StatusPublisher {
+    active_error: Option<String>,
+    failure_count: u64,
+    last_failure: Option<ObservedFailure>,
+}
+
+impl StatusPublisher {
+    fn new() -> Self {
+        Self {
+            active_error: None,
+            failure_count: 0,
+            last_failure: None,
+        }
+    }
+
+    fn publish(
+        &mut self,
+        paths: &Paths,
+        config: &AppConfig,
+        engine: &Engine,
+        hardware: &Hardware,
+        journals: &JournalTracker,
+    ) {
+        match write_status(paths, config, engine, hardware, journals, self) {
+            Ok(()) => {
+                if let Some(error) = self.active_error.take() {
+                    log_event(
+                        "status-write-recovered",
+                        &format!("status cache is writable again after {error}"),
+                    );
+                }
+            }
+            Err(error) => self.observe_failure_at(format!("{error:#}"), epoch_seconds()),
+        }
+    }
+
+    fn observe_failure_at(&mut self, message: String, occurred_at: u64) {
+        let changed = self.active_error.as_deref() != Some(message.as_str());
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.last_failure = Some(ObservedFailure {
+            occurred_at,
+            message: message.clone(),
+        });
+        self.active_error = Some(message.clone());
+        if changed {
+            log_event("status-write-failed", &message);
+        }
+    }
+}
+
 struct FlashController {
     bright: bool,
     last_toggle: Instant,
@@ -205,8 +261,13 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut flash = FlashController::new();
     let mut lighting_watchdog = LightingWatchdog::new();
     let mut hardware = Hardware::new();
+    let mut status_publisher = StatusPublisher::new();
+    log_event(
+        "daemon-started",
+        &format!("pid={}", std::process::id()),
+    );
     hardware.connect(&config, &engine);
-    write_status(&paths, &config, &engine, &hardware, &journals)?;
+    status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
     let mut status_persistence = StatusPersistence::new();
 
     let mut buffer = [0_u8; 8_192];
@@ -235,7 +296,8 @@ pub fn run(paths: Paths) -> Result<()> {
                         &mut flash,
                     );
                     if status_persistence.note(Instant::now(), status_write) {
-                        write_status(&paths, &config, &engine, &hardware, &journals)?;
+                        status_publisher
+                            .publish(&paths, &config, &engine, &hardware, &journals);
                     }
                 }
                 Err(error) => {
@@ -283,7 +345,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     .into_iter()
                     .map(|slot| slot.session_id),
             );
-            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
         }
 
@@ -300,10 +362,10 @@ pub fn run(paths: Paths) -> Result<()> {
             &mut flash,
         );
         if status_persistence.note(Instant::now(), status_write) {
-            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
         }
         if previous_journal_error != *journals.last_error() {
-            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
         }
 
@@ -327,7 +389,8 @@ pub fn run(paths: Paths) -> Result<()> {
                                 .into_iter()
                                 .map(|slot| slot.session_id),
                         );
-                        write_status(&paths, &config, &engine, &hardware, &journals)?;
+                        status_publisher
+                            .publish(&paths, &config, &engine, &hardware, &journals);
                         status_persistence.mark_flushed();
                     }
                     Err(error) => eprintln!("configuration reload rejected: {error:#}"),
@@ -337,7 +400,7 @@ pub fn run(paths: Paths) -> Result<()> {
 
         if hardware.retry_due() {
             hardware.connect(&config, &engine);
-            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
         }
 
@@ -350,12 +413,12 @@ pub fn run(paths: Paths) -> Result<()> {
         if lighting_watchdog.take_if_due(Instant::now(), reassert_interval)
             && hardware.reassert_direct_lighting(&config, &engine)
         {
-            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
         }
 
         if status_persistence.take_if_due(Instant::now()) {
-            write_status(&paths, &config, &engine, &hardware, &journals)?;
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
         }
     }
 }
@@ -562,6 +625,10 @@ struct Hardware {
     keyboard: Option<G915>,
     last_error: Option<String>,
     last_navigation_error: Option<String>,
+    failure_count: u64,
+    connection_count: u64,
+    last_failure: Option<ObservedFailure>,
+    last_connected_at: Option<u64>,
     next_retry: Instant,
 }
 
@@ -571,6 +638,10 @@ impl Hardware {
             keyboard: None,
             last_error: None,
             last_navigation_error: None,
+            failure_count: 0,
+            connection_count: 0,
+            last_failure: None,
+            last_connected_at: None,
             next_retry: Instant::now(),
         }
     }
@@ -583,8 +654,7 @@ impl Hardware {
         match G915::connect(&config.device) {
             Ok((mut keyboard, summary)) => {
                 if let Err(error) = keyboard.set_background(config.lighting.background) {
-                    self.last_error = Some(format!("G915 initialization failed: {error:#}"));
-                    self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+                    self.schedule_retry(format!("G915 initialization failed: {error:#}"));
                     return;
                 }
                 let active = engine.active_lighting(100, config);
@@ -593,9 +663,9 @@ impl Hardware {
                     .map(|change| (change.key, change.color))
                     .collect();
                 if let Err(error) = keyboard.set_keys(&active) {
-                    self.last_error =
-                        Some(format!("G915 task-light initialization failed: {error:#}"));
-                    self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+                    self.schedule_retry(format!(
+                        "G915 task-light initialization failed: {error:#}"
+                    ));
                     return;
                 }
                 match keyboard.set_g_key_navigation(config.navigation.enabled) {
@@ -610,25 +680,27 @@ impl Hardware {
                             Some(format!("G-key navigation initialization failed: {error:#}"));
                     }
                 }
-                self.last_error = None;
-                eprintln!(
-                    "connected {} {:04x}:{:04x}, {} lighting zones, per-key feature 0x{:02x}, G-key navigation {}",
-                    summary.product,
-                    summary.vendor_id,
-                    summary.product_id,
-                    summary.zone_count,
-                    summary.feature_indices.per_key_lighting,
-                    if keyboard.g_key_navigation_active() {
-                        "active"
-                    } else {
-                        "unavailable"
-                    }
+                self.record_connected_at(epoch_seconds());
+                log_event(
+                    "g915-connected",
+                    &format!(
+                        "{} {:04x}:{:04x}, {} lighting zones, per-key feature 0x{:02x}, G-key navigation {}",
+                        summary.product,
+                        summary.vendor_id,
+                        summary.product_id,
+                        summary.zone_count,
+                        summary.feature_indices.per_key_lighting,
+                        if keyboard.g_key_navigation_active() {
+                            "active"
+                        } else {
+                            "unavailable"
+                        }
+                    ),
                 );
                 self.keyboard = Some(keyboard);
             }
             Err(error) => {
-                self.last_error = Some(format!("{error:#}"));
-                self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+                self.schedule_retry(format!("{error:#}"));
             }
         }
     }
@@ -649,9 +721,7 @@ impl Hardware {
             .map(|change| (change.key, change.color))
             .collect();
         if let Err(error) = keyboard.set_keys(&keys) {
-            self.last_error = Some(format!("G915 lighting write failed: {error:#}"));
-            self.keyboard = None;
-            self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+            self.schedule_retry(format!("G915 lighting write failed: {error:#}"));
             return;
         }
         self.last_error = None;
@@ -684,9 +754,7 @@ impl Hardware {
                 })
         };
         if let Err(error) = result {
-            self.last_error = Some(format!("G915 direct-lighting watchdog failed: {error:#}"));
-            self.keyboard = None;
-            self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+            self.schedule_retry(format!("G915 direct-lighting watchdog failed: {error:#}"));
         } else {
             self.last_error = None;
         }
@@ -705,13 +773,10 @@ impl Hardware {
             .expect("keyboard checked above")
             .set_background(config.lighting.background);
         if let Err(error) = result {
-            self.last_error = Some(format!("G915 background refresh failed: {error:#}"));
-            self.keyboard = None;
-            self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+            self.schedule_retry(format!("G915 background refresh failed: {error:#}"));
             return;
         }
 
-        self.last_error = None;
         let navigation_result = self
             .keyboard
             .as_mut()
@@ -729,6 +794,7 @@ impl Hardware {
                     Some(format!("G-key navigation refresh failed: {error:#}"));
             }
         }
+        self.last_error = None;
         self.apply(config, engine, &engine.active_lighting(100, config));
     }
 
@@ -736,7 +802,7 @@ impl Hardware {
         if let Some(keyboard) = self.keyboard.as_mut()
             && let Err(error) = keyboard.set_background(config.lighting.background)
         {
-            self.last_error = Some(format!("failed to reset keyboard background: {error:#}"));
+            self.schedule_retry(format!("failed to reset keyboard background: {error:#}"));
         }
     }
 
@@ -768,11 +834,40 @@ impl Hardware {
         match keyboard.poll_g_key_presses() {
             Ok(pressed) => pressed,
             Err(error) => {
-                self.last_error = Some(format!("G915 input read failed: {error:#}"));
-                self.keyboard = None;
-                self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+                self.schedule_retry(format!("G915 input read failed: {error:#}"));
                 Vec::new()
             }
+        }
+    }
+
+    fn schedule_retry(&mut self, message: String) {
+        self.record_failure_at(message, epoch_seconds());
+        self.keyboard = None;
+        self.next_retry = Instant::now() + DEVICE_RETRY_INTERVAL;
+    }
+
+    fn record_failure_at(&mut self, message: String, occurred_at: u64) {
+        let changed = self.last_error.as_deref() != Some(message.as_str());
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.last_failure = Some(ObservedFailure {
+            occurred_at,
+            message: message.clone(),
+        });
+        self.last_error = Some(message.clone());
+        if changed {
+            log_event("g915-failure", &message);
+        }
+    }
+
+    fn record_connected_at(&mut self, connected_at: u64) {
+        let recovered_from = self.last_error.take();
+        self.connection_count = self.connection_count.saturating_add(1);
+        self.last_connected_at = Some(connected_at);
+        if let Some(error) = recovered_from {
+            log_event(
+                "g915-recovered",
+                &format!("connection restored after {error}"),
+            );
         }
     }
 }
@@ -784,6 +879,12 @@ struct DaemonStatus<'a> {
     config_path: String,
     device_connected: bool,
     last_error: &'a Option<String>,
+    hardware_connection_count: u64,
+    hardware_failure_count: u64,
+    last_hardware_connected_at: Option<u64>,
+    last_hardware_failure: &'a Option<ObservedFailure>,
+    status_write_failure_count: u64,
+    last_status_write_failure: &'a Option<ObservedFailure>,
     g_key_navigation_enabled: bool,
     g_key_navigation_active: bool,
     last_navigation_error: &'a Option<String>,
@@ -828,6 +929,7 @@ fn write_status(
     engine: &Engine,
     hardware: &Hardware,
     journals: &JournalTracker,
+    status_publisher: &StatusPublisher,
 ) -> Result<()> {
     let status = DaemonStatus {
         pid: std::process::id(),
@@ -835,6 +937,12 @@ fn write_status(
         config_path: paths.config.display().to_string(),
         device_connected: hardware.keyboard.is_some(),
         last_error: &hardware.last_error,
+        hardware_connection_count: hardware.connection_count,
+        hardware_failure_count: hardware.failure_count,
+        last_hardware_connected_at: hardware.last_connected_at,
+        last_hardware_failure: &hardware.last_failure,
+        status_write_failure_count: status_publisher.failure_count,
+        last_status_write_failure: &status_publisher.last_failure,
         g_key_navigation_enabled: config.navigation.enabled,
         g_key_navigation_active: hardware
             .keyboard
@@ -876,17 +984,23 @@ pub fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
+fn log_event(event: &str, message: &str) {
+    eprintln!("ts={} event={event} message={message:?}", epoch_seconds());
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
+    use std::fs;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, Paths};
+    use crate::journal::JournalTracker;
     use crate::state::{Engine, RestoredSlot, StateKind};
 
     use super::{
-        FlashController, LightingWatchdog, StatusPersistence, StatusWriteRequest,
-        prune_unadmitted_sessions,
+        FlashController, Hardware, LightingWatchdog, StatusPersistence, StatusPublisher,
+        StatusWriteRequest, prune_unadmitted_sessions,
     };
 
     #[test]
@@ -1003,6 +1117,76 @@ mod tests {
         ));
         assert!(
             !persistence.take_if_due(start + Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn status_write_failure_is_recorded_without_escaping_the_daemon() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codex-agent-indicator-status-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-directory");
+        fs::write(&blocker, b"block status path").unwrap();
+        let mut paths = Paths {
+            config: root.join("config.toml"),
+            codex_sessions: root.join("sessions"),
+            runtime_dir: root.clone(),
+            socket: root.join("indicator.sock"),
+            status: blocker.join("status.json"),
+        };
+        let config = AppConfig::default();
+        let engine = Engine::new(config.behavior.max_sessions);
+        let hardware = Hardware::new();
+        let journals = JournalTracker::new(paths.codex_sessions.clone());
+        let mut publisher = StatusPublisher::new();
+
+        publisher.publish(&paths, &config, &engine, &hardware, &journals);
+
+        assert_eq!(publisher.failure_count, 1);
+        assert!(
+            publisher
+                .last_failure
+                .as_ref()
+                .is_some_and(|failure| failure.message.contains("failed to write"))
+        );
+
+        paths.status = root.join("status.json");
+        publisher.publish(&paths, &config, &engine, &hardware, &journals);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.status).unwrap()).unwrap();
+        assert_eq!(persisted["status_write_failure_count"], 1);
+        assert!(
+            persisted["last_status_write_failure"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("failed to write"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovered_hardware_failure_remains_available_for_diagnosis() {
+        let mut hardware = Hardware::new();
+
+        hardware.record_failure_at("G915 input read failed".to_owned(), 10);
+        hardware.record_connected_at(20);
+
+        assert!(hardware.last_error.is_none());
+        assert_eq!(hardware.failure_count, 1);
+        assert_eq!(hardware.connection_count, 1);
+        assert_eq!(hardware.last_connected_at, Some(20));
+        assert_eq!(
+            hardware
+                .last_failure
+                .as_ref()
+                .map(|failure| (failure.occurred_at, failure.message.as_str())),
+            Some((10, "G915 input read failed"))
         );
     }
 }

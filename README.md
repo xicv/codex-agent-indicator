@@ -51,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.5 --locked
+cargo install codex-agent-indicator --version 0.4.6 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.5 --locked --force
+cargo install codex-agent-indicator --version 0.4.6 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -164,7 +164,8 @@ The daemon automatically reloads valid changes. The main settings are:
 background = "#101820"
 flash_enabled = true
 flash_interval_ms = 500
-flash_dim_percent = 5
+flash_dim_percent = 20
+reassert_interval_ms = 2000
 
 [colors]
 working = "#007aff"
@@ -183,7 +184,8 @@ error = "#ff3b30"
   - `#304050` — brighter.
 
 - Increase `flash_interval_ms` for slower flashing.
-- Increase `flash_dim_percent` for a brighter dim phase.
+- Keep `flash_dim_percent` above zero so a delayed background process cannot
+  leave active indicators looking completely dark.
 - Set `flash_enabled = false` for steady status colours.
 - Increase `reassert_interval_ms` if you want less frequent direct-lighting
   watchdog refreshes.
@@ -213,6 +215,9 @@ error = "#ff3b30"
   keyboard is painted, preventing ghost keys.
 - A low-rate watchdog reasserts direct lighting mode after keyboard sleep or
   another lighting app takes control.
+- Status-cache write failures are recorded without stopping live lighting or
+  G-key navigation. The daemon reports the last status-write and G915 failures
+  after recovery so intermittent outages remain diagnosable.
 - A newer task cannot displace an unacknowledged green, red, purple, or amber
   state.
 - If all five keys need acknowledgement, open one before another task can be
@@ -245,7 +250,8 @@ Common causes:
   failure that writes neither record can still leave the last blue state; use
   `codex-agent-indicator set error TASK_ID` to correct that rare case manually.
 - The daemon log is stored at
-  `~/Library/Logs/codex-agent-indicator.log`.
+  `~/Library/Logs/codex-agent-indicator.log`. Hardware and persistence recovery
+  events include Unix timestamps.
 
 ## Privacy and performance
 
