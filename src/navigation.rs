@@ -42,6 +42,9 @@ pub fn open_codex_thread(session_id: &str) -> Result<()> {
 mod tests {
     use super::{codex_open_arguments, codex_thread_url};
 
+    const LAUNCH_AGENT: &str =
+        include_str!("../launchd/com.codex-agent-indicator.plist.template");
+
     #[test]
     fn builds_deep_links_only_for_safe_technical_thread_ids() {
         assert_eq!(
@@ -64,5 +67,16 @@ mod tests {
             ])
         );
         assert_eq!(codex_open_arguments("../settings"), None);
+    }
+
+    #[test]
+    fn launch_agent_prioritizes_physical_g_key_navigation() {
+        assert!(
+            LAUNCH_AGENT.contains(
+                "<key>ProcessType</key>\n    <string>Interactive</string>"
+            ),
+            "physical G-key input must not run at background scheduling priority"
+        );
+        assert!(!LAUNCH_AGENT.contains("<string>Background</string>"));
     }
 }
