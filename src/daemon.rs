@@ -21,6 +21,8 @@ const CONFIG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const DEVICE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const G_KEY_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATUS_WRITE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(250);
+const EVENT_LOOP_DELAY_THRESHOLD: Duration = Duration::from_millis(250);
+const EVENT_LOOP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusWriteRequest {
@@ -83,6 +85,7 @@ struct StatusPublisher {
     active_error: Option<String>,
     failure_count: u64,
     last_failure: Option<ObservedFailure>,
+    event_loop: EventLoopHealth,
 }
 
 impl StatusPublisher {
@@ -91,6 +94,7 @@ impl StatusPublisher {
             active_error: None,
             failure_count: 0,
             last_failure: None,
+            event_loop: EventLoopHealth::new(),
         }
     }
 
@@ -217,6 +221,65 @@ impl LightingWatchdog {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ObservedDelay {
+    occurred_at: u64,
+    delay_ms: u64,
+}
+
+struct EventLoopHealth {
+    wait_deadline: Option<Instant>,
+    last_reported_at: Option<Instant>,
+    delay_count: u64,
+    last_delay: Option<ObservedDelay>,
+    max_delay_ms: u64,
+}
+
+impl EventLoopHealth {
+    fn new() -> Self {
+        Self {
+            wait_deadline: None,
+            last_reported_at: None,
+            delay_count: 0,
+            last_delay: None,
+            max_delay_ms: 0,
+        }
+    }
+
+    fn begin_wait(&mut self, now: Instant, interval: Duration) {
+        self.wait_deadline = Some(now + interval);
+    }
+
+    fn observe_at(&mut self, now: Instant, occurred_at: u64) -> bool {
+        let Some(deadline) = self.wait_deadline.take() else {
+            return false;
+        };
+        let delay = now.saturating_duration_since(deadline);
+        if delay < EVENT_LOOP_DELAY_THRESHOLD {
+            return false;
+        }
+
+        let delay_ms = duration_millis(delay);
+        self.delay_count = self.delay_count.saturating_add(1);
+        self.max_delay_ms = self.max_delay_ms.max(delay_ms);
+        self.last_delay = Some(ObservedDelay {
+            occurred_at,
+            delay_ms,
+        });
+        true
+    }
+
+    fn take_report_if_due(&mut self, now: Instant) -> bool {
+        if self.last_reported_at.is_some_and(|last_reported| {
+            now.saturating_duration_since(last_reported) < EVENT_LOOP_REPORT_INTERVAL
+        }) {
+            return false;
+        }
+        self.last_reported_at = Some(now);
+        true
+    }
+}
+
 pub fn run(paths: Paths) -> Result<()> {
     fs::create_dir_all(&paths.runtime_dir).with_context(|| {
         format!(
@@ -272,13 +335,43 @@ pub fn run(paths: Paths) -> Result<()> {
 
     let mut buffer = [0_u8; 8_192];
     loop {
-        let now = Instant::now();
-        let flash_poll = flash.poll_interval(now, &config, &engine);
-        let status_poll = status_persistence.poll_interval(now);
-        let journal_poll = journals.poll_interval(now);
-        socket.set_read_timeout(Some(
-            hardware.poll_interval(flash_poll.min(status_poll).min(journal_poll)),
-        ))?;
+        let observed_at = Instant::now();
+        let event_loop_report = if status_publisher
+            .event_loop
+            .observe_at(observed_at, epoch_seconds())
+            && status_publisher
+                .event_loop
+                .take_report_if_due(observed_at)
+        {
+            let delay = status_publisher
+                .event_loop
+                .last_delay
+                .as_ref()
+                .expect("delay was just observed");
+            Some(format!(
+                "delay_ms={} count={} max_delay_ms={}",
+                delay.delay_ms,
+                status_publisher.event_loop.delay_count,
+                status_publisher.event_loop.max_delay_ms
+            ))
+        } else {
+            None
+        };
+        if let Some(report) = event_loop_report {
+            log_event("event-loop-delay", &report);
+            status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
+            status_persistence.mark_flushed();
+        }
+
+        let wait_started = Instant::now();
+        let flash_poll = flash.poll_interval(wait_started, &config, &engine);
+        let status_poll = status_persistence.poll_interval(wait_started);
+        let journal_poll = journals.poll_interval(wait_started);
+        let poll_interval = hardware.poll_interval(flash_poll.min(status_poll).min(journal_poll));
+        socket.set_read_timeout(Some(poll_interval))?;
+        status_publisher
+            .event_loop
+            .begin_wait(wait_started, poll_interval);
         match socket.recv(&mut buffer) {
             Ok(length) => match serde_json::from_slice::<EventMessage>(&buffer[..length]) {
                 Ok(message) => {
@@ -521,6 +614,7 @@ fn handle_message(
             retain_journals_for_slots(reload.journals, engine, config);
             StatusWriteRequest::Immediate
         }
+        EventMessage::Snapshot => StatusWriteRequest::Immediate,
     }
 }
 
@@ -629,6 +723,10 @@ struct Hardware {
     connection_count: u64,
     last_failure: Option<ObservedFailure>,
     last_connected_at: Option<u64>,
+    lighting_reassertion_count: u64,
+    last_lighting_reasserted_at: Option<u64>,
+    last_lighting_reassert_duration_ms: Option<u64>,
+    max_lighting_reassert_duration_ms: u64,
     next_retry: Instant,
 }
 
@@ -642,6 +740,10 @@ impl Hardware {
             connection_count: 0,
             last_failure: None,
             last_connected_at: None,
+            lighting_reassertion_count: 0,
+            last_lighting_reasserted_at: None,
+            last_lighting_reassert_duration_ms: None,
+            max_lighting_reassert_duration_ms: 0,
             next_retry: Instant::now(),
         }
     }
@@ -734,6 +836,7 @@ impl Hardware {
             return self.last_error != previous_error;
         }
 
+        let started_at = Instant::now();
         let keys: Vec<_> = engine
             .active_lighting(100, config)
             .iter()
@@ -757,8 +860,18 @@ impl Hardware {
             self.schedule_retry(format!("G915 direct-lighting watchdog failed: {error:#}"));
         } else {
             self.last_error = None;
+            self.record_lighting_reassertion_at(epoch_seconds(), started_at.elapsed());
         }
         self.last_error != previous_error
+    }
+
+    fn record_lighting_reassertion_at(&mut self, occurred_at: u64, duration: Duration) {
+        let duration_ms = duration_millis(duration);
+        self.lighting_reassertion_count = self.lighting_reassertion_count.saturating_add(1);
+        self.last_lighting_reasserted_at = Some(occurred_at);
+        self.last_lighting_reassert_duration_ms = Some(duration_ms);
+        self.max_lighting_reassert_duration_ms =
+            self.max_lighting_reassert_duration_ms.max(duration_ms);
     }
 
     fn refresh(&mut self, config: &AppConfig, engine: &Engine) {
@@ -883,8 +996,15 @@ struct DaemonStatus<'a> {
     hardware_failure_count: u64,
     last_hardware_connected_at: Option<u64>,
     last_hardware_failure: &'a Option<ObservedFailure>,
+    lighting_reassertion_count: u64,
+    last_lighting_reasserted_at: Option<u64>,
+    last_lighting_reassert_duration_ms: Option<u64>,
+    max_lighting_reassert_duration_ms: u64,
     status_write_failure_count: u64,
     last_status_write_failure: &'a Option<ObservedFailure>,
+    event_loop_delay_count: u64,
+    last_event_loop_delay: &'a Option<ObservedDelay>,
+    max_event_loop_delay_ms: u64,
     g_key_navigation_enabled: bool,
     g_key_navigation_active: bool,
     last_navigation_error: &'a Option<String>,
@@ -941,8 +1061,15 @@ fn write_status(
         hardware_failure_count: hardware.failure_count,
         last_hardware_connected_at: hardware.last_connected_at,
         last_hardware_failure: &hardware.last_failure,
+        lighting_reassertion_count: hardware.lighting_reassertion_count,
+        last_lighting_reasserted_at: hardware.last_lighting_reasserted_at,
+        last_lighting_reassert_duration_ms: hardware.last_lighting_reassert_duration_ms,
+        max_lighting_reassert_duration_ms: hardware.max_lighting_reassert_duration_ms,
         status_write_failure_count: status_publisher.failure_count,
         last_status_write_failure: &status_publisher.last_failure,
+        event_loop_delay_count: status_publisher.event_loop.delay_count,
+        last_event_loop_delay: &status_publisher.event_loop.last_delay,
+        max_event_loop_delay_ms: status_publisher.event_loop.max_delay_ms,
         g_key_navigation_enabled: config.navigation.enabled,
         g_key_navigation_active: hardware
             .keyboard
@@ -984,6 +1111,10 @@ pub fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn log_event(event: &str, message: &str) {
     eprintln!("ts={} event={event} message={message:?}", epoch_seconds());
 }
@@ -999,8 +1130,8 @@ mod tests {
     use crate::state::{Engine, RestoredSlot, StateKind};
 
     use super::{
-        FlashController, Hardware, LightingWatchdog, StatusPersistence, StatusPublisher,
-        StatusWriteRequest, prune_unadmitted_sessions,
+        EventLoopHealth, FlashController, Hardware, LightingWatchdog, StatusPersistence,
+        StatusPublisher, StatusWriteRequest, prune_unadmitted_sessions,
     };
 
     #[test]
@@ -1087,6 +1218,54 @@ mod tests {
     }
 
     #[test]
+    fn records_only_actionable_event_loop_delay() {
+        let start = Instant::now();
+        let mut health = EventLoopHealth::new();
+
+        health.begin_wait(start, Duration::from_millis(25));
+        assert!(!health.observe_at(start + Duration::from_millis(274), 10));
+        assert_eq!(health.delay_count, 0);
+
+        health.begin_wait(start + Duration::from_secs(1), Duration::from_millis(25));
+        assert!(health.observe_at(start + Duration::from_millis(1_275), 20));
+        assert_eq!(health.delay_count, 1);
+        assert_eq!(health.max_delay_ms, 250);
+        assert_eq!(
+            health
+                .last_delay
+                .as_ref()
+                .map(|delay| (delay.occurred_at, delay.delay_ms)),
+            Some((20, 250))
+        );
+        let observed_at = start + Duration::from_millis(1_275);
+        assert!(health.take_report_if_due(observed_at));
+        assert!(!health.take_report_if_due(observed_at + Duration::from_secs(29)));
+        assert!(health.take_report_if_due(observed_at + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn records_successful_lighting_reassertions_without_clearing_failure_history() {
+        let mut hardware = Hardware::new();
+        hardware.record_failure_at("earlier HID failure".to_owned(), 5);
+
+        hardware.record_lighting_reassertion_at(10, Duration::from_millis(14));
+        hardware.record_lighting_reassertion_at(20, Duration::from_millis(9));
+
+        assert_eq!(hardware.lighting_reassertion_count, 2);
+        assert_eq!(hardware.last_lighting_reasserted_at, Some(20));
+        assert_eq!(hardware.last_lighting_reassert_duration_ms, Some(9));
+        assert_eq!(hardware.max_lighting_reassert_duration_ms, 14);
+        assert_eq!(hardware.failure_count, 1);
+        assert_eq!(
+            hardware
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
+            Some("earlier HID failure")
+        );
+    }
+
+    #[test]
     fn debounces_repeated_non_visible_status_updates() {
         let start = Instant::now();
         let mut persistence = StatusPersistence::new();
@@ -1142,9 +1321,19 @@ mod tests {
         };
         let config = AppConfig::default();
         let engine = Engine::new(config.behavior.max_sessions);
-        let hardware = Hardware::new();
+        let mut hardware = Hardware::new();
+        hardware.record_lighting_reassertion_at(30, Duration::from_millis(12));
         let journals = JournalTracker::new(paths.codex_sessions.clone());
+        let loop_start = Instant::now();
         let mut publisher = StatusPublisher::new();
+        publisher
+            .event_loop
+            .begin_wait(loop_start, Duration::from_millis(25));
+        assert!(
+            publisher
+                .event_loop
+                .observe_at(loop_start + Duration::from_millis(325), 40)
+        );
 
         publisher.publish(&paths, &config, &engine, &hardware, &journals);
 
@@ -1161,6 +1350,14 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&paths.status).unwrap()).unwrap();
         assert_eq!(persisted["status_write_failure_count"], 1);
+        assert_eq!(persisted["lighting_reassertion_count"], 1);
+        assert_eq!(persisted["last_lighting_reasserted_at"], 30);
+        assert_eq!(persisted["last_lighting_reassert_duration_ms"], 12);
+        assert_eq!(persisted["max_lighting_reassert_duration_ms"], 12);
+        assert_eq!(persisted["event_loop_delay_count"], 1);
+        assert_eq!(persisted["last_event_loop_delay"]["occurred_at"], 40);
+        assert_eq!(persisted["last_event_loop_delay"]["delay_ms"], 300);
+        assert_eq!(persisted["max_event_loop_delay_ms"], 300);
         assert!(
             persisted["last_status_write_failure"]["message"]
                 .as_str()
