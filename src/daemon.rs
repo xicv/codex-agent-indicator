@@ -6,7 +6,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, Paths};
@@ -1095,6 +1095,32 @@ fn modified_at(path: &Path) -> Option<SystemTime> {
 }
 
 fn remove_stale_socket(path: &Path) -> Result<()> {
+    let probe = UnixDatagram::unbound().context("failed to create daemon socket probe")?;
+    probe
+        .set_nonblocking(true)
+        .context("failed to configure daemon socket probe")?;
+    let snapshot =
+        serde_json::to_vec(&EventMessage::Snapshot).context("failed to encode daemon probe")?;
+    match probe.send_to(&snapshot, path) {
+        Ok(_) => bail!(
+            "codex-agent-indicator daemon is already running at {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => bail!(
+            "codex-agent-indicator daemon is already running at {}",
+            path.display()
+        ),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            ) => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to probe daemon socket {}", path.display()));
+        }
+    }
+
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -1123,6 +1149,7 @@ fn log_event(event: &str, message: &str) {
 mod tests {
     use std::collections::HashSet;
     use std::fs;
+    use std::os::unix::net::UnixDatagram;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::config::{AppConfig, Paths};
@@ -1131,8 +1158,58 @@ mod tests {
 
     use super::{
         EventLoopHealth, FlashController, Hardware, LightingWatchdog, StatusPersistence,
-        StatusPublisher, StatusWriteRequest, prune_unadmitted_sessions,
+        StatusPublisher, StatusWriteRequest, prune_unadmitted_sessions, remove_stale_socket,
     };
+
+    fn temporary_root(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::path::Path::new("/tmp").join(format!(
+            "cai-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn active_daemon_socket_is_never_removed() {
+        let root = temporary_root("active");
+        fs::create_dir_all(&root).unwrap();
+        let socket_path = root.join("indicator.sock");
+        let socket = UnixDatagram::bind(&socket_path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let error = remove_stale_socket(&socket_path).unwrap_err();
+
+        assert!(error.to_string().contains("daemon is already running"));
+        assert!(socket_path.exists());
+        let mut buffer = [0_u8; 128];
+        let received = socket.recv(&mut buffer).unwrap();
+        let message: crate::wire::EventMessage =
+            serde_json::from_slice(&buffer[..received]).unwrap();
+        assert!(matches!(message, crate::wire::EventMessage::Snapshot));
+
+        drop(socket);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abandoned_daemon_socket_is_removed_before_binding() {
+        let root = temporary_root("stale");
+        fs::create_dir_all(&root).unwrap();
+        let socket_path = root.join("indicator.sock");
+        let socket = UnixDatagram::bind(&socket_path).unwrap();
+        drop(socket);
+        assert!(socket_path.exists());
+
+        remove_stale_socket(&socket_path).unwrap();
+
+        assert!(!socket_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn startup_prunes_ghost_and_non_app_slots_before_lighting_them() {
