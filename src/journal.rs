@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,6 +33,12 @@ pub struct SessionJournalTransition {
 pub struct JournalRestore {
     pub admitted_sessions: HashSet<String>,
     pub transitions: Vec<SessionJournalTransition>,
+}
+
+#[derive(Debug, Default)]
+pub struct JournalPoll {
+    pub transitions: Vec<SessionJournalTransition>,
+    pub removed_sessions: Vec<String>,
 }
 
 pub struct JournalReader {
@@ -332,15 +338,30 @@ impl JournalTracker {
         &mut self,
         now: Instant,
         config: &AppConfig,
-    ) -> Vec<SessionJournalTransition> {
+    ) -> JournalPoll {
         if now < self.next_poll {
-            return Vec::new();
+            return JournalPoll::default();
         }
         self.next_poll = now + JOURNAL_POLL_INTERVAL;
 
         let mut transitions = Vec::new();
+        let mut removed_sessions = Vec::new();
         let mut errors = Vec::new();
         for (session_id, reader) in &mut self.readers {
+            match fs::metadata(&reader.path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    removed_sessions.push(session_id.clone());
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(format!(
+                        "failed to inspect Codex lifecycle journal {}: {error:#}",
+                        reader.path.display()
+                    ));
+                    continue;
+                }
+            }
             match reader.poll(config) {
                 Ok(Some(transition)) => transitions.push(SessionJournalTransition {
                     session_id: session_id.clone(),
@@ -354,8 +375,14 @@ impl JournalTracker {
                 )),
             }
         }
+        for session_id in &removed_sessions {
+            self.readers.remove(session_id);
+        }
         self.finish_operation(errors);
-        transitions
+        JournalPoll {
+            transitions,
+            removed_sessions,
+        }
     }
 
     pub fn retain_sessions<I, S>(&mut self, session_ids: I)
@@ -557,6 +584,7 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use serde_json::json;
 
@@ -745,6 +773,38 @@ mod tests {
         assert!(!tracker.register_live("subagent-session", &subagent).unwrap());
         assert_eq!(tracker.source_count(), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn polling_removes_a_session_moved_out_of_active_sessions() {
+        let root = temporary_directory("active-root");
+        let archive = temporary_directory("archive-root");
+        let path = named_journal(
+            &root,
+            "archived-session",
+            &desktop_journal("archived-session"),
+        );
+        let mut tracker = JournalTracker::new(root.clone());
+        let config = AppConfig::default();
+        assert!(
+            tracker
+                .register_live("archived-session", &path)
+                .unwrap()
+        );
+
+        fs::rename(
+            &path,
+            archive.join(path.file_name().expect("journal file name")),
+        )
+        .unwrap();
+        let poll = tracker.poll_if_due(Instant::now() + Duration::from_secs(1), &config);
+
+        assert!(poll.transitions.is_empty());
+        assert_eq!(poll.removed_sessions, ["archived-session"]);
+        assert_eq!(tracker.source_count(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(archive).unwrap();
     }
 
     #[test]
