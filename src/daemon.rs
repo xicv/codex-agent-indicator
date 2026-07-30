@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, Paths};
 use crate::device::G915;
-use crate::journal::{JournalTracker, SessionJournalTransition};
+use crate::journal::{JournalPoll, JournalTracker, SessionJournalTransition};
 use crate::navigation::open_codex_thread;
 use crate::state::{Engine, LightingChange, RestoredSlot};
 use crate::wire::{EventMessage, LifecycleTracker};
@@ -443,14 +443,12 @@ pub fn run(paths: Paths) -> Result<()> {
         }
 
         let previous_journal_error = journals.last_error().clone();
-        let transitions = journals.poll_if_due(Instant::now(), &config);
-        for transition in &transitions {
-            lifecycle.clear(Some(&transition.session_id));
-        }
-        let status_write = apply_journal_transitions(
-            transitions,
+        let poll = journals.poll_if_due(Instant::now(), &config);
+        let status_write = apply_journal_poll(
+            poll,
             &config,
             &mut engine,
+            &mut lifecycle,
             &mut hardware,
             &mut flash,
         );
@@ -643,6 +641,44 @@ fn apply_journal_transitions(
     } else {
         StatusWriteRequest::Immediate
     }
+}
+
+fn apply_journal_poll(
+    poll: JournalPoll,
+    config: &AppConfig,
+    engine: &mut Engine,
+    lifecycle: &mut LifecycleTracker,
+    hardware: &mut Hardware,
+    flash: &mut FlashController,
+) -> StatusWriteRequest {
+    for transition in &poll.transitions {
+        lifecycle.clear(Some(&transition.session_id));
+    }
+    let transition_request =
+        apply_journal_transitions(poll.transitions, config, engine, hardware, flash);
+
+    if poll.removed_sessions.is_empty() {
+        return transition_request;
+    }
+
+    let changes =
+        clear_removed_journal_sessions(poll.removed_sessions, config, engine, lifecycle);
+    apply_state_change(config, engine, hardware, flash, &changes);
+    StatusWriteRequest::Immediate
+}
+
+fn clear_removed_journal_sessions(
+    session_ids: Vec<String>,
+    config: &AppConfig,
+    engine: &mut Engine,
+    lifecycle: &mut LifecycleTracker,
+) -> Vec<LightingChange> {
+    let mut changes = Vec::new();
+    for session_id in session_ids {
+        lifecycle.clear(Some(&session_id));
+        changes.extend(engine.clear_session(&session_id, config));
+    }
+    changes
 }
 
 fn retain_journals_for_slots(
@@ -1155,10 +1191,12 @@ mod tests {
     use crate::config::{AppConfig, Paths};
     use crate::journal::JournalTracker;
     use crate::state::{Engine, RestoredSlot, StateKind};
+    use crate::wire::LifecycleTracker;
 
     use super::{
         EventLoopHealth, FlashController, Hardware, LightingWatchdog, StatusPersistence,
-        StatusPublisher, StatusWriteRequest, prune_unadmitted_sessions, remove_stale_socket,
+        StatusPublisher, StatusWriteRequest, clear_removed_journal_sessions,
+        prune_unadmitted_sessions, remove_stale_socket,
     };
 
     fn temporary_root(label: &str) -> std::path::PathBuf {
@@ -1248,6 +1286,30 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].session_id, "desktop-task");
         assert_eq!(snapshot[0].state, StateKind::Done);
+    }
+
+    #[test]
+    fn archived_journal_removes_its_indicator_slot() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(config.behavior.max_sessions);
+        engine.transition("archived-session", StateKind::Working, 10, &config);
+        let mut lifecycle = LifecycleTracker::default();
+
+        let changes = clear_removed_journal_sessions(
+            vec!["archived-session".to_owned()],
+            &config,
+            &mut engine,
+            &mut lifecycle,
+        );
+
+        assert!(engine.snapshot(&config).is_empty());
+        assert_eq!(
+            changes,
+            [crate::state::LightingChange {
+                key: config.device.slot_keys[0],
+                color: config.lighting.background,
+            }]
+        );
     }
 
     #[test]
