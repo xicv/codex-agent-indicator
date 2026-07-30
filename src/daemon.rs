@@ -13,7 +13,7 @@ use crate::config::{AppConfig, Paths};
 use crate::device::G915;
 use crate::journal::{JournalPoll, JournalTracker, SessionJournalTransition};
 use crate::navigation::open_codex_thread;
-use crate::state::{Engine, LightingChange, RestoredSlot};
+use crate::state::{Engine, LightingChange, RestoredQueuedSession, RestoredSlot};
 use crate::wire::{EventMessage, LifecycleTracker};
 
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -301,11 +301,7 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut last_config_check = Instant::now();
     let mut engine = restore_engine(&paths, config.behavior.max_sessions);
     let mut journals = JournalTracker::new(paths.codex_sessions.clone());
-    let restored_sessions = engine
-        .snapshot(&config)
-        .into_iter()
-        .map(|slot| slot.session_id)
-        .collect::<Vec<_>>();
+    let restored_sessions = engine.tracked_session_ids();
     let restored = journals.restore(restored_sessions, &config);
     prune_unadmitted_sessions(
         &mut engine,
@@ -432,12 +428,7 @@ pub fn run(paths: Paths) -> Result<()> {
             }
         }
         if navigation_status_changed {
-            journals.retain_sessions(
-                engine
-                    .snapshot(&config)
-                    .into_iter()
-                    .map(|slot| slot.session_id),
-            );
+            journals.retain_sessions(engine.tracked_session_ids());
             status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
         }
@@ -474,12 +465,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     Ok(()) => {
                         config_modified = current_modified;
                         lifecycle.clear(None);
-                        journals.retain_sessions(
-                            engine
-                                .snapshot(&config)
-                                .into_iter()
-                                .map(|slot| slot.session_id),
-                        );
+                        journals.retain_sessions(engine.tracked_session_ids());
                         status_publisher
                             .publish(&paths, &config, &engine, &hardware, &journals);
                         status_persistence.mark_flushed();
@@ -564,12 +550,12 @@ fn handle_message(
             ..
         } => {
             let Some(state) = hook_state else {
-                retain_journals_for_slots(reload.journals, engine, config);
+                retain_journals_for_engine(reload.journals, engine);
                 return StatusWriteRequest::None;
             };
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
             apply_state_change(config, engine, hardware, flash, &changes);
-            retain_journals_for_slots(reload.journals, engine, config);
+            retain_journals_for_engine(reload.journals, engine);
             if changes.is_empty() {
                 StatusWriteRequest::Deferred
             } else {
@@ -579,7 +565,7 @@ fn handle_message(
         EventMessage::Set { session_id, state } => {
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
             apply_state_change(config, engine, hardware, flash, &changes);
-            retain_journals_for_slots(reload.journals, engine, config);
+            retain_journals_for_engine(reload.journals, engine);
             if changes.is_empty() {
                 StatusWriteRequest::Deferred
             } else {
@@ -609,7 +595,7 @@ fn handle_message(
                 lifecycle.clear(None);
                 *reload.config_modified = modified_at(&reload.paths.config);
             }
-            retain_journals_for_slots(reload.journals, engine, config);
+            retain_journals_for_engine(reload.journals, engine);
             StatusWriteRequest::Immediate
         }
         EventMessage::Snapshot => StatusWriteRequest::Immediate,
@@ -681,17 +667,8 @@ fn clear_removed_journal_sessions(
     changes
 }
 
-fn retain_journals_for_slots(
-    journals: &mut JournalTracker,
-    engine: &Engine,
-    config: &AppConfig,
-) {
-    journals.retain_sessions(
-        engine
-            .snapshot(config)
-            .into_iter()
-            .map(|slot| slot.session_id),
-    );
+fn retain_journals_for_engine(journals: &mut JournalTracker, engine: &Engine) {
+    journals.retain_sessions(engine.tracked_session_ids());
 }
 
 fn prune_unadmitted_sessions(
@@ -700,9 +677,8 @@ fn prune_unadmitted_sessions(
     config: &AppConfig,
 ) {
     let stale_sessions = engine
-        .snapshot(config)
+        .tracked_session_ids()
         .into_iter()
-        .map(|slot| slot.session_id)
         .filter(|session_id| !admitted_sessions.contains(session_id))
         .collect::<Vec<_>>();
     for session_id in stale_sessions {
@@ -1047,12 +1023,15 @@ struct DaemonStatus<'a> {
     lifecycle_sources: usize,
     last_lifecycle_error: &'a Option<String>,
     slots: Vec<crate::state::SlotSnapshot>,
+    queued_sessions: Vec<RestoredQueuedSession>,
 }
 
 #[derive(Deserialize)]
 struct RestorableStatus {
     #[serde(default)]
     slots: Vec<RestoredSlot>,
+    #[serde(default)]
+    queued_sessions: Vec<RestoredQueuedSession>,
 }
 
 fn restore_engine(paths: &Paths, max_sessions: usize) -> Engine {
@@ -1068,7 +1047,9 @@ fn restore_engine(paths: &Paths, max_sessions: usize) -> Engine {
         }
     };
     match status {
-        Ok(status) => Engine::restore(max_sessions, status.slots),
+        Ok(status) => {
+            Engine::restore(max_sessions, status.slots, status.queued_sessions)
+        }
         Err(error) => {
             eprintln!(
                 "ignored invalid indicator state in {}: {error}",
@@ -1115,6 +1096,7 @@ fn write_status(
         lifecycle_sources: journals.source_count(),
         last_lifecycle_error: journals.last_error(),
         slots: engine.snapshot(config),
+        queued_sessions: engine.queued_snapshot(),
     };
     let content = serde_json::to_vec_pretty(&status)?;
     let temporary = paths.status.with_extension("json.tmp");
@@ -1196,7 +1178,7 @@ mod tests {
     use super::{
         EventLoopHealth, FlashController, Hardware, LightingWatchdog, StatusPersistence,
         StatusPublisher, StatusWriteRequest, clear_removed_journal_sessions,
-        prune_unadmitted_sessions, remove_stale_socket,
+        prune_unadmitted_sessions, remove_stale_socket, restore_engine, write_status,
     };
 
     fn temporary_root(label: &str) -> std::path::PathBuf {
@@ -1274,6 +1256,7 @@ mod tests {
                     updated_at: 12,
                 },
             ],
+            Vec::new(),
         );
 
         prune_unadmitted_sessions(
@@ -1286,6 +1269,114 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].session_id, "desktop-task");
         assert_eq!(snapshot[0].state, StateKind::Done);
+    }
+
+    #[test]
+    fn startup_prunes_unadmitted_waiting_tasks_before_promotion() {
+        let mut config = AppConfig::default();
+        config.behavior.max_sessions = 1;
+        config.device.slot_keys.truncate(1);
+        let mut engine = Engine::new(1);
+        engine.transition("visible", StateKind::Working, 10, &config);
+        engine.transition("missing-ghost", StateKind::Working, 20, &config);
+        engine.transition("desktop-waiting", StateKind::Working, 30, &config);
+
+        prune_unadmitted_sessions(
+            &mut engine,
+            &HashSet::from([
+                "visible".to_owned(),
+                "desktop-waiting".to_owned(),
+            ]),
+            &config,
+        );
+        engine.clear_session("visible", &config);
+
+        assert_eq!(
+            engine.session_for_g_key(1),
+            Some("desktop-waiting")
+        );
+    }
+
+    #[test]
+    fn startup_restores_waiting_tasks_without_remapping_visible_g_keys() {
+        let root = temporary_root("restore-waiting");
+        fs::create_dir_all(&root).unwrap();
+        let paths = Paths {
+            config: root.join("config.toml"),
+            codex_sessions: root.join("sessions"),
+            runtime_dir: root.clone(),
+            socket: root.join("indicator.sock"),
+            status: root.join("status.json"),
+        };
+        fs::write(
+            &paths.status,
+            serde_json::to_vec(&serde_json::json!({
+                "slots": [{
+                    "slot": 1,
+                    "session_id": "visible",
+                    "state": "working",
+                    "updated_at": 10
+                }],
+                "queued_sessions": [{
+                    "session_id": "waiting",
+                    "state": "requested",
+                    "updated_at": 20
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = AppConfig::default();
+
+        let mut engine = restore_engine(&paths, 1);
+        engine.clear_session("visible", &config);
+
+        assert_eq!(engine.session_for_g_key(1), Some("waiting"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn status_persists_waiting_tasks_for_restart() {
+        let root = temporary_root("persist-waiting");
+        fs::create_dir_all(&root).unwrap();
+        let paths = Paths {
+            config: root.join("config.toml"),
+            codex_sessions: root.join("sessions"),
+            runtime_dir: root.clone(),
+            socket: root.join("indicator.sock"),
+            status: root.join("status.json"),
+        };
+        let mut config = AppConfig::default();
+        config.behavior.max_sessions = 1;
+        config.device.slot_keys.truncate(1);
+        let mut engine = Engine::new(1);
+        engine.transition("visible", StateKind::Working, 10, &config);
+        engine.transition("waiting", StateKind::Requested, 20, &config);
+        let hardware = Hardware::new();
+        let journals = JournalTracker::new(paths.codex_sessions.clone());
+        let publisher = StatusPublisher::new();
+
+        write_status(
+            &paths,
+            &config,
+            &engine,
+            &hardware,
+            &journals,
+            &publisher,
+        )
+        .unwrap();
+
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.status).unwrap()).unwrap();
+        assert_eq!(
+            status["queued_sessions"],
+            serde_json::json!([{
+                "session_id": "waiting",
+                "state": "requested",
+                "updated_at": 20
+            }])
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

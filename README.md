@@ -51,7 +51,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.10 --locked
+cargo install codex-agent-indicator --version 0.4.11 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +72,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.10 --locked --force
+cargo install codex-agent-indicator --version 0.4.11 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -231,11 +231,15 @@ error = "#ff3b30"
 - The `status` command asks the daemon for a fresh, state-neutral snapshot
   before reading the local cache, so diagnostics are current without adding
   background polling.
-- A newer task cannot displace an unacknowledged green, red, purple, or amber
-  state.
-- If all five keys need acknowledgement, open one before another task can be
-  assigned.
-- The oldest blue working slot may be reused when all keys are occupied.
+- Once assigned, a task keeps the same G-key until it is archived, cleared, or
+  its terminal or attention state is opened and acknowledged. New tasks never
+  displace an existing blue, green, red, purple, or amber key.
+- Additional Codex Desktop tasks wait in FIFO order when all five keys are
+  occupied. The oldest waiting task is promoted onto the exact key that becomes
+  free, without remapping the other four keys.
+- Waiting tasks keep receiving lifecycle updates and remain queued across
+  daemon or Mac restarts. `codex-agent-indicator status` reports them under
+  `queued_sessions`.
 - G-key navigation explicitly targets the Codex app, brings it to the
   foreground, and selects the task through its local deep link.
 - A task is acknowledged only after its Codex deep link opens successfully.
@@ -277,9 +281,9 @@ Common causes:
   metadata record. Only a top-level Codex Desktop task is admitted; unknown or
   missing metadata fails closed.
 - The daemon follows only the local journals for tasks currently assigned to
-  G1 through G5. It reads at most 256 KiB to classify a journal, scans at most
-  the latest 8 MiB once after a restart, then checks only for appended bytes
-  every 250 ms.
+  G1 through G5 or waiting for a free G-key. It reads at most 256 KiB to
+  classify a journal, scans at most the latest 8 MiB once after a restart, then
+  checks only for appended bytes every 250 ms.
 - It ignores non-lifecycle journal records and never stores journal content in
   its status file or logs.
 - The daemon does not poll Codex databases or processes and does not start a

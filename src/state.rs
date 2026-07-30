@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::str::FromStr;
 
@@ -66,6 +66,7 @@ pub struct LightingChange {
 #[derive(Debug)]
 pub struct Engine {
     slots: Vec<Option<Slot>>,
+    waiting: VecDeque<Slot>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,14 +77,26 @@ pub struct RestoredSlot {
     pub updated_at: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RestoredQueuedSession {
+    pub session_id: String,
+    pub state: StateKind,
+    pub updated_at: u64,
+}
+
 impl Engine {
     pub fn new(max_sessions: usize) -> Self {
         Self {
             slots: vec![None; max_sessions],
+            waiting: VecDeque::new(),
         }
     }
 
-    pub fn restore(max_sessions: usize, slots: Vec<RestoredSlot>) -> Self {
+    pub fn restore(
+        max_sessions: usize,
+        slots: Vec<RestoredSlot>,
+        queued_sessions: Vec<RestoredQueuedSession>,
+    ) -> Self {
         let mut engine = Self::new(max_sessions);
         let mut restored_sessions = HashSet::new();
         for restored in slots {
@@ -104,6 +117,25 @@ impl Engine {
                 updated_at: restored.updated_at,
             });
         }
+        for restored in queued_sessions {
+            if restored.session_id.is_empty()
+                || restored.state == StateKind::Idle
+                || !restored_sessions.insert(restored.session_id.clone())
+            {
+                continue;
+            }
+            engine.waiting.push_back(Slot {
+                session_id: restored.session_id,
+                state: restored.state,
+                updated_at: restored.updated_at,
+            });
+        }
+        while let Some(slot_index) = engine.select_slot() {
+            let Some(waiting) = engine.waiting.pop_front() else {
+                break;
+            };
+            engine.slots[slot_index] = Some(waiting);
+        }
         engine
     }
 
@@ -118,6 +150,16 @@ impl Engine {
             return self.clear_session(session_id, config);
         }
 
+        if let Some(waiting) = self
+            .waiting
+            .iter_mut()
+            .find(|waiting| waiting.session_id == session_id)
+        {
+            waiting.state = state;
+            waiting.updated_at = now;
+            return Vec::new();
+        }
+
         let Some(slot_index) = self
             .slots
             .iter()
@@ -127,6 +169,11 @@ impl Engine {
             })
             .or_else(|| self.select_slot())
         else {
+            self.waiting.push_back(Slot {
+                session_id: session_id.to_string(),
+                state,
+                updated_at: now,
+            });
             return Vec::new();
         };
 
@@ -160,6 +207,7 @@ impl Engine {
             .slots
             .iter()
             .filter_map(Option::as_ref)
+            .chain(self.waiting.iter())
             .find(|slot| slot.session_id == session_id)
             .map_or(occurred_at, |slot| slot.updated_at.max(occurred_at));
         self.transition(session_id, state, updated_at, config)
@@ -170,6 +218,15 @@ impl Engine {
         session_id: &str,
         config: &AppConfig,
     ) -> Vec<LightingChange> {
+        if let Some(waiting_index) = self
+            .waiting
+            .iter()
+            .position(|waiting| waiting.session_id == session_id)
+        {
+            self.waiting.remove(waiting_index);
+            return Vec::new();
+        }
+
         let Some(slot_index) = self.slots.iter().position(|slot| {
             slot.as_ref()
                 .is_some_and(|slot| slot.session_id == session_id)
@@ -177,14 +234,11 @@ impl Engine {
             return Vec::new();
         };
 
-        self.slots[slot_index] = None;
-        vec![LightingChange {
-            key: config.device.slot_keys[slot_index],
-            color: config.lighting.background,
-        }]
+        self.release_slot(slot_index, config)
     }
 
     pub fn clear_all(&mut self, config: &AppConfig) -> Vec<LightingChange> {
+        self.waiting.clear();
         let mut changes = Vec::new();
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if slot.take().is_some() {
@@ -249,6 +303,30 @@ impl Engine {
             .collect()
     }
 
+    pub fn queued_snapshot(&self) -> Vec<RestoredQueuedSession> {
+        self.waiting
+            .iter()
+            .map(|waiting| RestoredQueuedSession {
+                session_id: waiting.session_id.clone(),
+                state: waiting.state,
+                updated_at: waiting.updated_at,
+            })
+            .collect()
+    }
+
+    pub fn tracked_session_ids(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|slot| slot.session_id.clone())
+            .chain(
+                self.waiting
+                    .iter()
+                    .map(|waiting| waiting.session_id.clone()),
+            )
+            .collect()
+    }
+
     pub fn has_active_slots(&self) -> bool {
         self.slots.iter().any(Option::is_some)
     }
@@ -276,28 +354,26 @@ impl Engine {
             return Vec::new();
         }
 
-        self.slots[slot_index] = None;
+        self.release_slot(slot_index, config)
+    }
+
+    fn release_slot(
+        &mut self,
+        slot_index: usize,
+        config: &AppConfig,
+    ) -> Vec<LightingChange> {
+        self.slots[slot_index] = self.waiting.pop_front();
         vec![LightingChange {
             key: config.device.slot_keys[slot_index],
-            color: config.lighting.background,
+            color: self.slots[slot_index]
+                .as_ref()
+                .map(|slot| config.color_for(slot.state))
+                .unwrap_or(config.lighting.background),
         }]
     }
 
     fn select_slot(&self) -> Option<usize> {
-        if let Some(index) = self.slots.iter().position(Option::is_none) {
-            return Some(index);
-        }
-
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                slot.as_ref()
-                    .filter(|slot| slot.state == StateKind::Working)
-                    .map(|slot| (index, slot.updated_at))
-            })
-            .min_by_key(|(_, updated_at)| *updated_at)
-            .map(|(index, _)| index)
+        self.slots.iter().position(Option::is_none)
     }
 }
 
@@ -317,7 +393,7 @@ pub struct SlotSnapshot {
 mod tests {
     use crate::config::{AppConfig, Color};
 
-    use super::{Engine, RestoredSlot, StateKind};
+    use super::{Engine, RestoredQueuedSession, RestoredSlot, StateKind};
 
     #[test]
     fn assigns_and_reuses_a_slot() {
@@ -337,7 +413,110 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unacknowledged_terminal_state_when_slots_are_full() {
+    fn sixth_working_task_does_not_remap_existing_g_keys() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(5);
+        for index in 1..=5 {
+            engine.transition(
+                &format!("task-{index}"),
+                StateKind::Working,
+                index,
+                &config,
+            );
+        }
+        let before = engine
+            .snapshot(&config)
+            .into_iter()
+            .map(|slot| (slot.key, slot.session_id))
+            .collect::<Vec<_>>();
+
+        let changes = engine.transition("task-6", StateKind::Working, 6, &config);
+
+        let after = engine
+            .snapshot(&config)
+            .into_iter()
+            .map(|slot| (slot.key, slot.session_id))
+            .collect::<Vec<_>>();
+        assert!(changes.is_empty());
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn oldest_waiting_task_is_promoted_when_a_g_key_becomes_free() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(5);
+        for index in 1..=7 {
+            engine.transition(
+                &format!("task-{index}"),
+                StateKind::Working,
+                index,
+                &config,
+            );
+        }
+
+        let changes = engine.clear_session("task-3", &config);
+
+        assert_eq!(
+            changes,
+            [super::LightingChange {
+                key: config.device.slot_keys[2],
+                color: config.color_for(StateKind::Working),
+            }]
+        );
+        let snapshot = engine.snapshot(&config);
+        assert_eq!(snapshot[2].session_id, "task-6");
+        assert!(!snapshot.iter().any(|slot| slot.session_id == "task-7"));
+    }
+
+    #[test]
+    fn waiting_task_uses_its_latest_state_when_promoted() {
+        let mut config = AppConfig::default();
+        config.behavior.max_sessions = 1;
+        config.device.slot_keys.truncate(1);
+        let mut engine = Engine::new(1);
+        engine.transition("visible", StateKind::Working, 10, &config);
+        engine.transition("waiting", StateKind::Working, 20, &config);
+        engine.transition("waiting", StateKind::Requested, 30, &config);
+
+        let changes = engine.clear_session("visible", &config);
+
+        assert_eq!(
+            changes,
+            [super::LightingChange {
+                key: config.device.slot_keys[0],
+                color: config.color_for(StateKind::Requested),
+            }]
+        );
+        let promoted = &engine.snapshot(&config)[0];
+        assert_eq!(promoted.session_id, "waiting");
+        assert_eq!(promoted.state, StateKind::Requested);
+        assert_eq!(promoted.updated_at, 30);
+    }
+
+    #[test]
+    fn removed_waiting_task_is_never_promoted() {
+        let mut config = AppConfig::default();
+        config.behavior.max_sessions = 1;
+        config.device.slot_keys.truncate(1);
+        let mut engine = Engine::new(1);
+        engine.transition("visible", StateKind::Working, 10, &config);
+        engine.transition("removed", StateKind::Working, 20, &config);
+        engine.transition("next", StateKind::Working, 30, &config);
+
+        assert!(engine.clear_session("removed", &config).is_empty());
+        engine.clear_session("visible", &config);
+
+        assert_eq!(engine.session_for_g_key(1), Some("next"));
+        assert!(
+            !engine
+                .tracked_session_ids()
+                .iter()
+                .any(|session_id| session_id == "removed")
+        );
+    }
+
+    #[test]
+    fn preserves_existing_working_and_terminal_slots_when_full() {
         let mut config = AppConfig::default();
         config.behavior.max_sessions = 2;
         config.device.slot_keys.truncate(2);
@@ -348,7 +527,8 @@ mod tests {
 
         let snapshot = engine.snapshot(&config);
         assert!(snapshot.iter().any(|slot| slot.session_id == "done"));
-        assert!(!snapshot.iter().any(|slot| slot.session_id == "working"));
+        assert!(snapshot.iter().any(|slot| slot.session_id == "working"));
+        assert!(!snapshot.iter().any(|slot| slot.session_id == "new"));
     }
 
     #[test]
@@ -478,6 +658,7 @@ mod tests {
                     updated_at: 23,
                 },
             ],
+            Vec::new(),
         );
 
         let snapshot = engine.snapshot(&config);
@@ -488,12 +669,68 @@ mod tests {
     }
 
     #[test]
+    fn restores_waiting_tasks_in_fifo_order() {
+        let mut config = AppConfig::default();
+        config.behavior.max_sessions = 1;
+        config.device.slot_keys.truncate(1);
+        let mut engine = Engine::restore(
+            1,
+            vec![RestoredSlot {
+                slot: 1,
+                session_id: "visible".to_owned(),
+                state: StateKind::Working,
+                updated_at: 10,
+            }],
+            vec![
+                RestoredQueuedSession {
+                    session_id: "waiting-first".to_owned(),
+                    state: StateKind::Done,
+                    updated_at: 20,
+                },
+                RestoredQueuedSession {
+                    session_id: "waiting-second".to_owned(),
+                    state: StateKind::Requested,
+                    updated_at: 30,
+                },
+            ],
+        );
+
+        engine.clear_session("visible", &config);
+        assert_eq!(
+            engine.session_for_g_key(1),
+            Some("waiting-first")
+        );
+        engine.acknowledge_g_key(1, &config);
+        assert_eq!(
+            engine.session_for_g_key(1),
+            Some("waiting-second")
+        );
+    }
+
+    #[test]
     fn reconciliation_changes_truth_without_regressing_event_recency() {
         let config = AppConfig::default();
         let mut engine = Engine::new(5);
         engine.transition("task", StateKind::Working, 200, &config);
 
         engine.reconcile("task", StateKind::Done, 150, &config);
+
+        let snapshot = engine.snapshot(&config);
+        assert_eq!(snapshot[0].state, StateKind::Done);
+        assert_eq!(snapshot[0].updated_at, 200);
+    }
+
+    #[test]
+    fn waiting_reconciliation_changes_truth_without_regressing_event_recency() {
+        let mut config = AppConfig::default();
+        config.behavior.max_sessions = 1;
+        config.device.slot_keys.truncate(1);
+        let mut engine = Engine::new(1);
+        engine.transition("visible", StateKind::Working, 100, &config);
+        engine.transition("waiting", StateKind::Working, 200, &config);
+
+        engine.reconcile("waiting", StateKind::Done, 150, &config);
+        engine.clear_session("visible", &config);
 
         let snapshot = engine.snapshot(&config);
         assert_eq!(snapshot[0].state, StateKind::Done);
