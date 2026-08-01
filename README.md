@@ -19,17 +19,21 @@ monitor.
 | 🔴 Red | Codex stopped with an error |
 
 G1 through G5 each represent one top-level task from the Codex desktop app.
-Active keys flash brightly while the rest of the keyboard stays on with a dim,
-steady background. Codex CLI, `codex exec`, Claude Code integrations, other
+From 09:00 to 17:00 by default, active keys flash brightly while the rest of
+the keyboard stays on with a dim, steady background. At night the rest of the
+keyboard is dark and occupied G1-G5 indicators stay steadily lit at only 20%
+brightness, with success green raised to 40% so it remains visible. Codex CLI,
+`codex exec`, Claude Code integrations, other
 apps, and ephemeral tasks do not occupy G-keys.
 
 The indicator intentionally uses only G1 through G5. It leaves F1 through F12,
 M1 through M3, MR, media controls, macros, and onboard profiles untouched.
 
-Green, red, purple, and amber stay visible until you press their G-key. The key
-brings Codex to the foreground, selects the matching task in its sidebar, and
-then clears the acknowledged light. A blue key stays blue because its task is
-still working.
+Green, red, purple, and amber stay visible until the task is handled. Pressing
+the G-key brings Codex to the foreground and selects the matching task in its
+sidebar. Green and red clear after that successful navigation. Amber stays
+amber until Codex resumes the approved tool; purple stays purple until you
+submit the requested input. A blue key stays blue while its task works.
 
 ## Requirements
 
@@ -51,7 +55,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.11 --locked
+cargo install codex-agent-indicator --version 0.4.12 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -72,7 +76,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.11 --locked --force
+cargo install codex-agent-indicator --version 0.4.12 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -165,6 +169,11 @@ background = "#101820"
 flash_enabled = true
 flash_interval_ms = 500
 flash_dim_percent = 20
+day_start = "09:00"
+day_end = "17:00"
+night_background = "#000000"
+night_indicator_brightness_percent = 20
+night_done_brightness_percent = 40
 reassert_interval_ms = 1000
 
 [colors]
@@ -187,6 +196,21 @@ error = "#ff3b30"
 - Keep `flash_dim_percent` above zero so a delayed background process cannot
   leave active indicators looking completely dark.
 - Set `flash_enabled = false` for steady status colours.
+- `day_start` is inclusive and `day_end` is exclusive. The existing
+  `background`, `flash_enabled`, `flash_interval_ms`, and `flash_dim_percent`
+  settings form the day profile. Times use the Mac's current local timezone.
+- Night mode automatically covers the rest of the day, from `day_end` back to
+  `day_start`. It uses `night_background` for every ordinary and unoccupied
+  key, disables flashing, and scales occupied G1-G5 status colours to
+  `night_indicator_brightness_percent`. Success green uses
+  `night_done_brightness_percent` because the generic dim level is effectively
+  invisible on the G915.
+- The default schedule is day mode from `09:00` through `16:59`, then night
+  mode from `17:00` through `08:59`. A day window may cross midnight, such as
+  `day_start = "21:00"` and `day_end = "06:00"`.
+- Use strict 24-hour `HH:MM` times. `day_start` and `day_end` cannot be equal.
+  Both night brightness settings must be between 20 and 100 percent because
+  lower RGB values are effectively invisible on the G915.
 - Keep `reassert_interval_ms = 1000` for the fastest supported recovery when
   G HUB or another lighting app takes control. Increase it for less frequent
   direct-lighting watchdog refreshes.
@@ -225,15 +249,19 @@ error = "#ff3b30"
   G-key navigation. The daemon reports the last status-write and G915 failures
   after recovery so intermittent outages remain diagnosable.
 - `codex-agent-indicator status` also reports successful lighting reassertion
-  count/timing and event-loop delays of at least 250 ms. Routine successful
+  count/timing, the current `lighting_mode`, and event-loop delays of at least
+  250 ms. Routine successful
   reassertions stay quiet and do not force additional status-file writes;
   repeated loop-delay logs and writes are limited to once every 30 seconds.
 - The `status` command asks the daemon for a fresh, state-neutral snapshot
   before reading the local cache, so diagnostics are current without adding
   background polling.
-- Once assigned, a task keeps the same G-key until it is archived, cleared, or
-  its terminal or attention state is opened and acknowledged. New tasks never
-  displace an existing blue, green, red, purple, or amber key.
+- Once assigned, a task keeps the same G-key until it is archived, explicitly
+  cleared, or its terminal green/red state is opened and acknowledged. Opening
+  amber or purple changes only the selected Codex task; the attention state
+  remains mapped until Codex resumes the approved tool or receives the
+  requested input. New tasks never displace an existing blue, green, red,
+  purple, or amber key.
 - Additional Codex Desktop tasks wait in FIFO order when all five keys are
   occupied. The oldest waiting task is promoted onto the exact key that becomes
   free, without remapping the other four keys.
@@ -242,7 +270,9 @@ error = "#ff3b30"
   `queued_sessions`.
 - G-key navigation explicitly targets the Codex app, brings it to the
   foreground, and selects the task through its local deep link.
-- A task is acknowledged only after its Codex deep link opens successfully.
+- Terminal green/red is acknowledged only after its Codex deep link opens
+  successfully. Navigation never acknowledges amber or purple. Amber changes
+  back to blue only when Codex emits the subsequent tool-resumption event.
 - Merely ending a Codex process does not clear an unacknowledged result.
 
 ## Troubleshooting
@@ -284,6 +314,8 @@ Common causes:
   G1 through G5 or waiting for a free G-key. It reads at most 256 KiB to
   classify a journal, scans at most the latest 8 MiB once after a restart, then
   checks only for appended bytes every 250 ms.
+- The active day/night schedule is checked at most once per second and only
+  repaints when the selected mode changes.
 - It ignores non-lifecycle journal records and never stores journal content in
   its status file or logs.
 - The daemon does not poll Codex databases or processes and does not start a

@@ -1,6 +1,6 @@
 [package]
 name = "codex-agent-indicator"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 rust-version = "1.91"
 description = "Low-overhead Codex task status indicator for Logitech G915 G-keys"
@@ -26,6 +26,7 @@ include = [
 [dependencies]
 anyhow = "1.0.104"
 hidapi = { version = "2.6.6", features = ["macos-shared-device"] }
+libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.3"

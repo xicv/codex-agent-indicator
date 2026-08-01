@@ -26,10 +26,11 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "codex-agent-indicator"
-version = "0.4.11"
+version = "0.4.12"
 dependencies = [
  "anyhow",
  "hidapi",
+ "libc",
  "serde",
  "serde_json",
  "toml",
