@@ -402,6 +402,7 @@ impl Default for EventConfig {
 pub struct Paths {
     pub config: PathBuf,
     pub codex_sessions: PathBuf,
+    pub log: PathBuf,
     pub runtime_dir: PathBuf,
     pub socket: PathBuf,
     pub status: PathBuf,
@@ -426,6 +427,10 @@ impl Paths {
         Ok(Self {
             config,
             codex_sessions: codex_home.join("sessions"),
+            log: home
+                .join("Library")
+                .join("Logs")
+                .join("codex-agent-indicator.log"),
             socket: runtime_dir.join("indicator.sock"),
             status: runtime_dir.join("status.json"),
             runtime_dir,

@@ -55,7 +55,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.12 --locked
+cargo install codex-agent-indicator --version 0.4.13 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -76,7 +76,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.12 --locked --force
+cargo install codex-agent-indicator --version 0.4.13 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -301,6 +301,10 @@ Common causes:
   events include Unix timestamps. `event-loop-delay` identifies CPU scheduling
   or slow local work; a recent successful lighting reassertion with no loop,
   HID, or persistence failure points to another lighting app taking control.
+- The daemon checks the log once per minute. At 5 MiB it preserves the previous
+  contents as `.log.1`, shifts the older archive to `.log.2`, and truncates the
+  active file without interrupting launchd logging. This bounds normal log use
+  to about 15 MiB and requires no root service or external rotation tool.
 
 ## Privacy and performance
 
