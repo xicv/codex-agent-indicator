@@ -24,6 +24,14 @@ background = "#101820"
 flash_enabled = true
 flash_interval_ms = 500
 flash_dim_percent = 20
+# Current lighting settings are the day profile. Night runs from day_end until
+# day_start using the quiet settings below. Times use the Mac's local timezone.
+day_start = "09:00"
+day_end = "17:00"
+night_background = "#000000"
+night_indicator_brightness_percent = 20
+# Green needs a little more output than blue to remain visible on the G915.
+night_done_brightness_percent = 40
 # Reclaim direct lighting mode after keyboard sleep or another lighting app.
 reassert_interval_ms = 1000
 

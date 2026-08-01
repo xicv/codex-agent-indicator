@@ -5,7 +5,7 @@ use std::str::FromStr;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, Color};
+use crate::config::{AppConfig, Color, LightingMode};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,7 +251,12 @@ impl Engine {
         changes
     }
 
-    pub fn repaint(&self, config: &AppConfig) -> Vec<LightingChange> {
+    pub fn repaint_for_mode(
+        &self,
+        mode: LightingMode,
+        config: &AppConfig,
+    ) -> Vec<LightingChange> {
+        let background = config.lighting.background_for_mode(mode);
         self.slots
             .iter()
             .enumerate()
@@ -259,8 +264,14 @@ impl Engine {
                 key: config.device.slot_keys[index],
                 color: slot
                     .as_ref()
-                    .map(|slot| config.color_for(slot.state))
-                    .unwrap_or(config.lighting.background),
+                    .map(|slot| {
+                        config.color_for(slot.state).scale_percent(
+                            config
+                                .lighting
+                                .indicator_brightness_for_state(mode, slot.state),
+                        )
+                    })
+                    .unwrap_or(background),
             })
             .collect()
     }
@@ -279,6 +290,27 @@ impl Engine {
                     color: config
                         .color_for(slot.state)
                         .scale_percent(brightness_percent),
+                })
+            })
+            .collect()
+    }
+
+    pub fn active_lighting_for_mode(
+        &self,
+        mode: LightingMode,
+        config: &AppConfig,
+    ) -> Vec<LightingChange> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.as_ref().map(|slot| LightingChange {
+                    key: config.device.slot_keys[index],
+                    color: config.color_for(slot.state).scale_percent(
+                        config
+                            .lighting
+                            .indicator_brightness_for_state(mode, slot.state),
+                    ),
                 })
             })
             .collect()
@@ -347,14 +379,20 @@ impl Engine {
         let Some(slot_index) = g_key.checked_sub(1) else {
             return Vec::new();
         };
-        let Some(slot) = self.slots.get(slot_index).and_then(Option::as_ref) else {
+        let Some(state) = self
+            .slots
+            .get(slot_index)
+            .and_then(Option::as_ref)
+            .map(|slot| slot.state)
+        else {
             return Vec::new();
         };
-        if slot.state == StateKind::Working {
-            return Vec::new();
+        match state {
+            StateKind::Done | StateKind::Error => self.release_slot(slot_index, config),
+            StateKind::Idle | StateKind::Working | StateKind::Approval | StateKind::Requested => {
+                Vec::new()
+            }
         }
-
-        self.release_slot(slot_index, config)
     }
 
     fn release_slot(
@@ -391,7 +429,7 @@ pub struct SlotSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{AppConfig, Color};
+    use crate::config::{AppConfig, Color, LightingMode};
 
     use super::{Engine, RestoredQueuedSession, RestoredSlot, StateKind};
 
@@ -584,6 +622,29 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_approval_g_key_keeps_it_amber_until_the_tool_resumes() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(5);
+        engine.transition("approval-task", StateKind::Approval, 100, &config);
+
+        let changes = engine.acknowledge_g_key(1, &config);
+
+        assert!(changes.is_empty());
+        assert_eq!(engine.snapshot(&config)[0].state, StateKind::Approval);
+        assert_eq!(engine.session_for_g_key(1), Some("approval-task"));
+    }
+
+    #[test]
+    fn opening_an_input_request_keeps_it_purple_until_input_is_submitted() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(5);
+        engine.transition("input-task", StateKind::Requested, 100, &config);
+
+        assert!(engine.acknowledge_g_key(1, &config).is_empty());
+        assert_eq!(engine.snapshot(&config)[0].state, StateKind::Requested);
+    }
+
+    #[test]
     fn builds_a_scaled_frame_for_active_g_keys_only() {
         let config = AppConfig::default();
         let mut engine = Engine::new(5);
@@ -611,6 +672,41 @@ mod tests {
                 blue: 0,
             }
         );
+    }
+
+    #[test]
+    fn night_repaint_keeps_only_dim_status_colours_on_occupied_g_keys() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(5);
+        engine.transition("working", StateKind::Working, 10, &config);
+        engine.transition("approval", StateKind::Approval, 11, &config);
+        engine.transition("done", StateKind::Done, 12, &config);
+
+        let frame = engine.repaint_for_mode(LightingMode::Night, &config);
+
+        assert_eq!(frame.len(), 5);
+        assert_eq!(
+            frame[0].color,
+            config
+                .colors
+                .working
+                .scale_percent(config.lighting.night_indicator_brightness_percent)
+        );
+        assert_eq!(
+            frame[1].color,
+            config
+                .colors
+                .approval
+                .scale_percent(config.lighting.night_indicator_brightness_percent)
+        );
+        assert_eq!(
+            frame[2].color,
+            config
+                .colors
+                .done
+                .scale_percent(config.lighting.night_done_brightness_percent)
+        );
+        assert!(frame[3..].iter().all(|change| change.color == Color::BLACK));
     }
 
     #[test]

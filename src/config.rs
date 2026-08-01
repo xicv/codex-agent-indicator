@@ -19,7 +19,6 @@ pub struct Color {
 }
 
 impl Color {
-    #[cfg(test)]
     pub const BLACK: Self = Self {
         red: 0,
         green: 0,
@@ -73,6 +72,71 @@ impl<'de> Deserialize<'de> for Color {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockTime {
+    minute_of_day: u16,
+}
+
+impl ClockTime {
+    pub const fn minute_of_day(self) -> u16 {
+        self.minute_of_day
+    }
+}
+
+impl fmt::Display for ClockTime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:02}:{:02}",
+            self.minute_of_day / 60,
+            self.minute_of_day % 60
+        )
+    }
+}
+
+impl FromStr for ClockTime {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let Some((hour, minute)) = value.split_once(':') else {
+            bail!("time must use 24-hour HH:MM format, got {value:?}");
+        };
+        if hour.len() != 2
+            || minute.len() != 2
+            || !hour.bytes().all(|byte| byte.is_ascii_digit())
+            || !minute.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            bail!("time must use 24-hour HH:MM format, got {value:?}");
+        }
+        let hour: u16 = hour.parse()?;
+        let minute: u16 = minute.parse()?;
+        if hour > 23 || minute > 59 {
+            bail!("time must be between 00:00 and 23:59, got {value:?}");
+        }
+        Ok(Self {
+            minute_of_day: hour * 60 + minute,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ClockTime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightingMode {
+    Day,
+    Night,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -121,6 +185,15 @@ impl AppConfig {
         }
         if self.lighting.flash_dim_percent > 100 {
             bail!("lighting.flash_dim_percent must not exceed 100");
+        }
+        if !(20..=100).contains(&self.lighting.night_indicator_brightness_percent) {
+            bail!("lighting.night_indicator_brightness_percent must be between 20 and 100");
+        }
+        if !(20..=100).contains(&self.lighting.night_done_brightness_percent) {
+            bail!("lighting.night_done_brightness_percent must be between 20 and 100");
+        }
+        if self.lighting.day_start == self.lighting.day_end {
+            bail!("lighting.day_start and lighting.day_end must be different");
         }
         if !(1_000..=60_000).contains(&self.lighting.reassert_interval_ms) {
             bail!("lighting.reassert_interval_ms must be between 1000 and 60000");
@@ -201,6 +274,49 @@ pub struct LightingConfig {
     pub flash_interval_ms: u64,
     pub flash_dim_percent: u8,
     pub reassert_interval_ms: u64,
+    pub day_start: ClockTime,
+    pub day_end: ClockTime,
+    pub night_background: Color,
+    pub night_indicator_brightness_percent: u8,
+    pub night_done_brightness_percent: u8,
+}
+
+impl LightingConfig {
+    pub fn mode_at_minute(&self, minute_of_day: u16) -> LightingMode {
+        let start = self.day_start.minute_of_day();
+        let end = self.day_end.minute_of_day();
+        let is_day = if start < end {
+            (start..end).contains(&minute_of_day)
+        } else {
+            minute_of_day >= start || minute_of_day < end
+        };
+        if is_day {
+            LightingMode::Day
+        } else {
+            LightingMode::Night
+        }
+    }
+
+    pub fn background_for_mode(&self, mode: LightingMode) -> Color {
+        match mode {
+            LightingMode::Day => self.background,
+            LightingMode::Night => self.night_background,
+        }
+    }
+
+    pub fn indicator_brightness_for_state(
+        &self,
+        mode: LightingMode,
+        state: StateKind,
+    ) -> u8 {
+        match mode {
+            LightingMode::Day => 100,
+            LightingMode::Night if state == StateKind::Done => {
+                self.night_done_brightness_percent
+            }
+            LightingMode::Night => self.night_indicator_brightness_percent,
+        }
+    }
 }
 
 impl Default for LightingConfig {
@@ -211,6 +327,11 @@ impl Default for LightingConfig {
             flash_interval_ms: 500,
             flash_dim_percent: 20,
             reassert_interval_ms: 1_000,
+            day_start: "09:00".parse().expect("valid time"),
+            day_end: "17:00".parse().expect("valid time"),
+            night_background: Color::BLACK,
+            night_indicator_brightness_percent: 20,
+            night_done_brightness_percent: 40,
         }
     }
 }
@@ -314,7 +435,7 @@ impl Paths {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, Color, DEFAULT_CONFIG};
+    use super::{AppConfig, Color, LightingMode, DEFAULT_CONFIG};
 
     #[test]
     fn parses_embedded_configuration() {
@@ -323,8 +444,44 @@ mod tests {
         assert_eq!(config.device.slot_keys, [0xb4, 0xb5, 0xb6, 0xb7, 0xb8]);
         assert_eq!(config.lighting.flash_dim_percent, 20);
         assert_eq!(config.lighting.reassert_interval_ms, 1_000);
+        assert_eq!(config.lighting.day_start.to_string(), "09:00");
+        assert_eq!(config.lighting.day_end.to_string(), "17:00");
+        assert_eq!(config.lighting.night_background, Color::BLACK);
+        assert_eq!(config.lighting.night_indicator_brightness_percent, 20);
+        assert_eq!(config.lighting.night_done_brightness_percent, 40);
         assert!(config.navigation.enabled);
         assert_eq!(config.events.post_tool_failure, crate::state::StateKind::Working);
+    }
+
+    #[test]
+    fn selects_day_and_night_at_configured_local_time_boundaries() {
+        let mut config = AppConfig::default();
+
+        assert_eq!(config.lighting.mode_at_minute(8 * 60 + 59), LightingMode::Night);
+        assert_eq!(config.lighting.mode_at_minute(9 * 60), LightingMode::Day);
+        assert_eq!(config.lighting.mode_at_minute(16 * 60 + 59), LightingMode::Day);
+        assert_eq!(config.lighting.mode_at_minute(17 * 60), LightingMode::Night);
+
+        config.lighting.day_start = "21:00".parse().unwrap();
+        config.lighting.day_end = "06:00".parse().unwrap();
+        assert_eq!(config.lighting.mode_at_minute(23 * 60), LightingMode::Day);
+        assert_eq!(config.lighting.mode_at_minute(5 * 60 + 59), LightingMode::Day);
+        assert_eq!(config.lighting.mode_at_minute(6 * 60), LightingMode::Night);
+    }
+
+    #[test]
+    fn rejects_an_invisible_night_indicator_or_ambiguous_schedule() {
+        let mut config = AppConfig::default();
+        config.lighting.night_indicator_brightness_percent = 19;
+        assert!(config.validate().is_err());
+
+        config.lighting.night_indicator_brightness_percent = 20;
+        config.lighting.night_done_brightness_percent = 19;
+        assert!(config.validate().is_err());
+
+        config.lighting.night_done_brightness_percent = 40;
+        config.lighting.day_end = config.lighting.day_start;
+        assert!(config.validate().is_err());
     }
 
     #[test]

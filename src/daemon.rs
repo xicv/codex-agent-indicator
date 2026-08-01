@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
+use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AppConfig, Paths};
+use crate::config::{AppConfig, LightingMode, Paths};
 use crate::device::G915;
 use crate::journal::{JournalPoll, JournalTracker, SessionJournalTransition};
 use crate::navigation::open_codex_thread;
@@ -23,6 +24,7 @@ const G_KEY_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATUS_WRITE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_LOOP_DELAY_THRESHOLD: Duration = Duration::from_millis(250);
 const EVENT_LOOP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+const LIGHTING_MODE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusWriteRequest {
@@ -159,13 +161,17 @@ impl FlashController {
         self.last_toggle = now;
     }
 
-    fn frame_if_due(
+    fn frame_if_due_for_mode(
         &mut self,
         now: Instant,
+        mode: LightingMode,
         config: &AppConfig,
         engine: &Engine,
     ) -> Option<Vec<LightingChange>> {
-        if !config.lighting.flash_enabled || !engine.has_active_slots() {
+        if mode == LightingMode::Night
+            || !config.lighting.flash_enabled
+            || !engine.has_active_slots()
+        {
             if !self.bright {
                 self.reset_at(now);
             }
@@ -187,8 +193,17 @@ impl FlashController {
         Some(engine.active_lighting(brightness, config))
     }
 
-    fn poll_interval(&self, now: Instant, config: &AppConfig, engine: &Engine) -> Duration {
-        if !config.lighting.flash_enabled || !engine.has_active_slots() {
+    fn poll_interval_for_mode(
+        &self,
+        now: Instant,
+        mode: LightingMode,
+        config: &AppConfig,
+        engine: &Engine,
+    ) -> Duration {
+        if mode == LightingMode::Night
+            || !config.lighting.flash_enabled
+            || !engine.has_active_slots()
+        {
             return SOCKET_POLL_INTERVAL;
         }
 
@@ -197,6 +212,73 @@ impl FlashController {
             .saturating_sub(now.saturating_duration_since(self.last_toggle))
             .clamp(Duration::from_millis(1), SOCKET_POLL_INTERVAL)
     }
+}
+
+struct LightingModeController {
+    mode: LightingMode,
+    last_checked: Instant,
+}
+
+impl LightingModeController {
+    fn new(config: &AppConfig) -> Result<Self> {
+        Ok(Self::new_at_minute(config, local_minute_of_day()?))
+    }
+
+    fn new_at_minute(config: &AppConfig, minute_of_day: u16) -> Self {
+        Self {
+            mode: config.lighting.mode_at_minute(minute_of_day),
+            last_checked: Instant::now(),
+        }
+    }
+
+    fn mode(&self) -> LightingMode {
+        self.mode
+    }
+
+    fn update_at_minute(&mut self, config: &AppConfig, minute_of_day: u16) -> bool {
+        let updated = config.lighting.mode_at_minute(minute_of_day);
+        if updated == self.mode {
+            return false;
+        }
+        self.mode = updated;
+        true
+    }
+
+    fn update_now(&mut self, config: &AppConfig) -> Result<bool> {
+        self.last_checked = Instant::now();
+        Ok(self.update_at_minute(config, local_minute_of_day()?))
+    }
+
+    fn update_if_due(&mut self, now: Instant, config: &AppConfig) -> Result<bool> {
+        if now.saturating_duration_since(self.last_checked) < LIGHTING_MODE_CHECK_INTERVAL {
+            return Ok(false);
+        }
+        self.last_checked = now;
+        Ok(self.update_at_minute(config, local_minute_of_day()?))
+    }
+}
+
+fn local_minute_of_day() -> Result<u16> {
+    let epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    let epoch_seconds: libc::time_t = epoch_seconds
+        .try_into()
+        .context("current time does not fit time_t")?;
+    let mut local = MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers remain valid for the call, and localtime_r writes one
+    // complete tm value into the caller-owned output buffer on success.
+    let result = unsafe { libc::localtime_r(&epoch_seconds, local.as_mut_ptr()) };
+    if result.is_null() {
+        bail!("localtime_r could not convert the current local time");
+    }
+    // SAFETY: a non-null localtime_r result confirms that the output was initialized.
+    let local = unsafe { local.assume_init() };
+    if !(0..=23).contains(&local.tm_hour) || !(0..=59).contains(&local.tm_min) {
+        bail!("localtime_r returned an invalid hour or minute");
+    }
+    Ok((local.tm_hour as u16) * 60 + local.tm_min as u16)
 }
 
 struct LightingWatchdog {
@@ -297,6 +379,7 @@ pub fn run(paths: Paths) -> Result<()> {
 
     let mut config = AppConfig::load(&paths.config)?;
     config.validate()?;
+    let mut lighting_mode = LightingModeController::new(&config)?;
     let mut config_modified = modified_at(&paths.config);
     let mut last_config_check = Instant::now();
     let mut engine = restore_engine(&paths, config.behavior.max_sessions);
@@ -325,7 +408,7 @@ pub fn run(paths: Paths) -> Result<()> {
         "daemon-started",
         &format!("pid={}", std::process::id()),
     );
-    hardware.connect(&config, &engine);
+    hardware.connect(&config, &engine, lighting_mode.mode());
     status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
     let mut status_persistence = StatusPersistence::new();
 
@@ -360,7 +443,12 @@ pub fn run(paths: Paths) -> Result<()> {
         }
 
         let wait_started = Instant::now();
-        let flash_poll = flash.poll_interval(wait_started, &config, &engine);
+        let flash_poll = flash.poll_interval_for_mode(
+            wait_started,
+            lighting_mode.mode(),
+            &config,
+            &engine,
+        );
         let status_poll = status_persistence.poll_interval(wait_started);
         let journal_poll = journals.poll_interval(wait_started);
         let poll_interval = hardware.poll_interval(flash_poll.min(status_poll).min(journal_poll));
@@ -377,6 +465,7 @@ pub fn run(paths: Paths) -> Result<()> {
                             paths: &paths,
                             config_modified: &mut config_modified,
                             journals: &mut journals,
+                            lighting_mode: &mut lighting_mode,
                         },
                         &mut config,
                         &mut engine,
@@ -422,6 +511,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     &engine,
                     &mut hardware,
                     &mut flash,
+                    lighting_mode.mode(),
                     &changes,
                 );
                 eprintln!("opened Codex task mapped to G{g_key}");
@@ -442,6 +532,7 @@ pub fn run(paths: Paths) -> Result<()> {
             &mut lifecycle,
             &mut hardware,
             &mut flash,
+            lighting_mode.mode(),
         );
         if status_persistence.note(Instant::now(), status_write) {
             status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
@@ -461,6 +552,7 @@ pub fn run(paths: Paths) -> Result<()> {
                     &mut engine,
                     &mut hardware,
                     &mut flash,
+                    &mut lighting_mode,
                 ) {
                     Ok(()) => {
                         config_modified = current_modified;
@@ -476,19 +568,35 @@ pub fn run(paths: Paths) -> Result<()> {
         }
 
         if hardware.retry_due() {
-            hardware.connect(&config, &engine);
+            hardware.connect(&config, &engine, lighting_mode.mode());
             status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
         }
 
-        if let Some(frame) = flash.frame_if_due(Instant::now(), &config, &engine) {
-            hardware.apply(&config, &engine, &frame);
+        match lighting_mode.update_if_due(Instant::now(), &config) {
+            Ok(true) => {
+                flash.reset();
+                hardware.refresh(&config, &engine, lighting_mode.mode());
+                status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
+                status_persistence.mark_flushed();
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("could not update day/night lighting mode: {error:#}"),
+        }
+
+        if let Some(frame) = flash.frame_if_due_for_mode(
+            Instant::now(),
+            lighting_mode.mode(),
+            &config,
+            &engine,
+        ) {
+            hardware.apply(&config, &engine, lighting_mode.mode(), &frame);
         }
 
         let reassert_interval =
             Duration::from_millis(config.lighting.reassert_interval_ms);
         if lighting_watchdog.take_if_due(Instant::now(), reassert_interval)
-            && hardware.reassert_direct_lighting(&config, &engine)
+            && hardware.reassert_direct_lighting(&config, &engine, lighting_mode.mode())
         {
             status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
@@ -504,6 +612,7 @@ struct ReloadContext<'a> {
     paths: &'a Paths,
     config_modified: &'a mut Option<SystemTime>,
     journals: &'a mut JournalTracker,
+    lighting_mode: &'a mut LightingModeController,
 }
 
 fn handle_message(
@@ -554,7 +663,14 @@ fn handle_message(
                 return StatusWriteRequest::None;
             };
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
-            apply_state_change(config, engine, hardware, flash, &changes);
+            apply_state_change(
+                config,
+                engine,
+                hardware,
+                flash,
+                reload.lighting_mode.mode(),
+                &changes,
+            );
             retain_journals_for_engine(reload.journals, engine);
             if changes.is_empty() {
                 StatusWriteRequest::Deferred
@@ -564,7 +680,14 @@ fn handle_message(
         }
         EventMessage::Set { session_id, state } => {
             let changes = engine.transition(&session_id, state, epoch_seconds(), config);
-            apply_state_change(config, engine, hardware, flash, &changes);
+            apply_state_change(
+                config,
+                engine,
+                hardware,
+                flash,
+                reload.lighting_mode.mode(),
+                &changes,
+            );
             retain_journals_for_engine(reload.journals, engine);
             if changes.is_empty() {
                 StatusWriteRequest::Deferred
@@ -579,7 +702,14 @@ fn handle_message(
                 Some(session_id) => engine.clear_session(&session_id, config),
                 None => engine.clear_all(config),
             };
-            apply_state_change(config, engine, hardware, flash, &changes);
+            apply_state_change(
+                config,
+                engine,
+                hardware,
+                flash,
+                reload.lighting_mode.mode(),
+                &changes,
+            );
             if changes.is_empty() {
                 StatusWriteRequest::None
             } else {
@@ -588,7 +718,14 @@ fn handle_message(
         }
         EventMessage::Reload => {
             if let Err(error) =
-                reload_config(reload.paths, config, engine, hardware, flash)
+                reload_config(
+                    reload.paths,
+                    config,
+                    engine,
+                    hardware,
+                    flash,
+                    reload.lighting_mode,
+                )
             {
                 hardware.last_error = Some(format!("configuration reload failed: {error:#}"));
             } else {
@@ -608,6 +745,7 @@ fn apply_journal_transitions(
     engine: &mut Engine,
     hardware: &mut Hardware,
     flash: &mut FlashController,
+    lighting_mode: LightingMode,
 ) -> StatusWriteRequest {
     if transitions.is_empty() {
         return StatusWriteRequest::None;
@@ -621,7 +759,14 @@ fn apply_journal_transitions(
             config,
         ));
     }
-    apply_state_change(config, engine, hardware, flash, &changes);
+    apply_state_change(
+        config,
+        engine,
+        hardware,
+        flash,
+        lighting_mode,
+        &changes,
+    );
     if changes.is_empty() {
         StatusWriteRequest::Deferred
     } else {
@@ -636,12 +781,20 @@ fn apply_journal_poll(
     lifecycle: &mut LifecycleTracker,
     hardware: &mut Hardware,
     flash: &mut FlashController,
+    lighting_mode: LightingMode,
 ) -> StatusWriteRequest {
     for transition in &poll.transitions {
         lifecycle.clear(Some(&transition.session_id));
     }
     let transition_request =
-        apply_journal_transitions(poll.transitions, config, engine, hardware, flash);
+        apply_journal_transitions(
+            poll.transitions,
+            config,
+            engine,
+            hardware,
+            flash,
+            lighting_mode,
+        );
 
     if poll.removed_sessions.is_empty() {
         return transition_request;
@@ -649,7 +802,14 @@ fn apply_journal_poll(
 
     let changes =
         clear_removed_journal_sessions(poll.removed_sessions, config, engine, lifecycle);
-    apply_state_change(config, engine, hardware, flash, &changes);
+    apply_state_change(
+        config,
+        engine,
+        hardware,
+        flash,
+        lighting_mode,
+        &changes,
+    );
     StatusWriteRequest::Immediate
 }
 
@@ -691,13 +851,19 @@ fn apply_state_change(
     engine: &Engine,
     hardware: &mut Hardware,
     flash: &mut FlashController,
+    lighting_mode: LightingMode,
     changes: &[LightingChange],
 ) {
     if changes.is_empty() {
         return;
     }
     flash.reset();
-    hardware.apply(config, engine, &engine.repaint(config));
+    hardware.apply(
+        config,
+        engine,
+        lighting_mode,
+        &engine.repaint_for_mode(lighting_mode, config),
+    );
 }
 
 fn reload_config(
@@ -706,6 +872,7 @@ fn reload_config(
     engine: &mut Engine,
     hardware: &mut Hardware,
     flash: &mut FlashController,
+    lighting_mode: &mut LightingModeController,
 ) -> Result<()> {
     let updated = AppConfig::load(&paths.config)?;
     updated.validate()?;
@@ -717,13 +884,14 @@ fn reload_config(
         || updated.device.usage != config.device.usage;
 
     if shape_changed {
-        hardware.reset_background(config);
+        hardware.reset_background(config, lighting_mode.mode());
         *engine = Engine::new(updated.behavior.max_sessions);
         hardware.disconnect();
     }
     *config = updated;
+    lighting_mode.update_now(config)?;
     flash.reset();
-    hardware.refresh(config, engine);
+    hardware.refresh(config, engine, lighting_mode.mode());
     Ok(())
 }
 
@@ -760,18 +928,19 @@ impl Hardware {
         }
     }
 
-    fn connect(&mut self, config: &AppConfig, engine: &Engine) {
+    fn connect(&mut self, config: &AppConfig, engine: &Engine, lighting_mode: LightingMode) {
         if self.keyboard.is_some() || !self.retry_due() {
             return;
         }
 
         match G915::connect(&config.device) {
             Ok((mut keyboard, summary)) => {
-                if let Err(error) = keyboard.set_background(config.lighting.background) {
+                let background = config.lighting.background_for_mode(lighting_mode);
+                if let Err(error) = keyboard.set_background(background) {
                     self.schedule_retry(format!("G915 initialization failed: {error:#}"));
                     return;
                 }
-                let active = engine.active_lighting(100, config);
+                let active = engine.active_lighting_for_mode(lighting_mode, config);
                 let active: Vec<_> = active
                     .iter()
                     .map(|change| (change.key, change.color))
@@ -819,12 +988,18 @@ impl Hardware {
         }
     }
 
-    fn apply(&mut self, config: &AppConfig, engine: &Engine, changes: &[LightingChange]) {
+    fn apply(
+        &mut self,
+        config: &AppConfig,
+        engine: &Engine,
+        lighting_mode: LightingMode,
+        changes: &[LightingChange],
+    ) {
         if changes.is_empty() {
             return;
         }
         if self.keyboard.is_none() {
-            self.connect(config, engine);
+            self.connect(config, engine, lighting_mode);
         }
         let Some(keyboard) = self.keyboard.as_mut() else {
             return;
@@ -841,16 +1016,21 @@ impl Hardware {
         self.last_error = None;
     }
 
-    fn reassert_direct_lighting(&mut self, config: &AppConfig, engine: &Engine) -> bool {
+    fn reassert_direct_lighting(
+        &mut self,
+        config: &AppConfig,
+        engine: &Engine,
+        lighting_mode: LightingMode,
+    ) -> bool {
         let previous_error = self.last_error.clone();
         if self.keyboard.is_none() {
-            self.connect(config, engine);
+            self.connect(config, engine, lighting_mode);
             return self.last_error != previous_error;
         }
 
         let started_at = Instant::now();
         let keys: Vec<_> = engine
-            .active_lighting(100, config)
+            .active_lighting_for_mode(lighting_mode, config)
             .iter()
             .map(|change| (change.key, change.color))
             .collect();
@@ -858,7 +1038,9 @@ impl Hardware {
             let keyboard = self.keyboard.as_mut().expect("keyboard checked above");
             keyboard
                 .reassert_direct_mode()
-                .and_then(|()| keyboard.set_background(config.lighting.background))
+                .and_then(|()| {
+                    keyboard.set_background(config.lighting.background_for_mode(lighting_mode))
+                })
                 .and_then(|()| keyboard.set_keys(&keys))
                 .and_then(|()| {
                     if config.navigation.enabled {
@@ -886,9 +1068,9 @@ impl Hardware {
             self.max_lighting_reassert_duration_ms.max(duration_ms);
     }
 
-    fn refresh(&mut self, config: &AppConfig, engine: &Engine) {
+    fn refresh(&mut self, config: &AppConfig, engine: &Engine, lighting_mode: LightingMode) {
         if self.keyboard.is_none() {
-            self.connect(config, engine);
+            self.connect(config, engine, lighting_mode);
             return;
         }
 
@@ -896,7 +1078,7 @@ impl Hardware {
             .keyboard
             .as_mut()
             .expect("keyboard checked above")
-            .set_background(config.lighting.background);
+            .set_background(config.lighting.background_for_mode(lighting_mode));
         if let Err(error) = result {
             self.schedule_retry(format!("G915 background refresh failed: {error:#}"));
             return;
@@ -920,12 +1102,18 @@ impl Hardware {
             }
         }
         self.last_error = None;
-        self.apply(config, engine, &engine.active_lighting(100, config));
+        self.apply(
+            config,
+            engine,
+            lighting_mode,
+            &engine.active_lighting_for_mode(lighting_mode, config),
+        );
     }
 
-    fn reset_background(&mut self, config: &AppConfig) {
+    fn reset_background(&mut self, config: &AppConfig, lighting_mode: LightingMode) {
         if let Some(keyboard) = self.keyboard.as_mut()
-            && let Err(error) = keyboard.set_background(config.lighting.background)
+            && let Err(error) =
+                keyboard.set_background(config.lighting.background_for_mode(lighting_mode))
         {
             self.schedule_retry(format!("failed to reset keyboard background: {error:#}"));
         }
@@ -1002,6 +1190,7 @@ struct DaemonStatus<'a> {
     pid: u32,
     updated_at: u64,
     config_path: String,
+    lighting_mode: LightingMode,
     device_connected: bool,
     last_error: &'a Option<String>,
     hardware_connection_count: u64,
@@ -1072,6 +1261,9 @@ fn write_status(
         pid: std::process::id(),
         updated_at: epoch_seconds(),
         config_path: paths.config.display().to_string(),
+        lighting_mode: config
+            .lighting
+            .mode_at_minute(local_minute_of_day()?),
         device_connected: hardware.keyboard.is_some(),
         last_error: &hardware.last_error,
         hardware_connection_count: hardware.connection_count,
@@ -1170,14 +1362,14 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use crate::config::{AppConfig, Paths};
+    use crate::config::{AppConfig, LightingMode, Paths};
     use crate::journal::JournalTracker;
     use crate::state::{Engine, RestoredSlot, StateKind};
     use crate::wire::LifecycleTracker;
 
     use super::{
-        EventLoopHealth, FlashController, Hardware, LightingWatchdog, StatusPersistence,
-        StatusPublisher, StatusWriteRequest, clear_removed_journal_sessions,
+        EventLoopHealth, FlashController, Hardware, LightingModeController, LightingWatchdog,
+        StatusPersistence, StatusPublisher, StatusWriteRequest, clear_removed_journal_sessions,
         prune_unadmitted_sessions, remove_stale_socket, restore_engine, write_status,
     };
 
@@ -1368,6 +1560,7 @@ mod tests {
 
         let status: serde_json::Value =
             serde_json::from_slice(&fs::read(&paths.status).unwrap()).unwrap();
+        assert!(matches!(status["lighting_mode"].as_str(), Some("day" | "night")));
         assert_eq!(
             status["queued_sessions"],
             serde_json::json!([{
@@ -1413,12 +1606,22 @@ mod tests {
 
         assert!(
             flash
-                .frame_if_due(start + Duration::from_millis(499), &config, &engine)
+                .frame_if_due_for_mode(
+                    start + Duration::from_millis(499),
+                    LightingMode::Day,
+                    &config,
+                    &engine,
+                )
                 .is_none()
         );
 
         let dim = flash
-            .frame_if_due(start + Duration::from_millis(500), &config, &engine)
+            .frame_if_due_for_mode(
+                start + Duration::from_millis(500),
+                LightingMode::Day,
+                &config,
+                &engine,
+            )
             .expect("dim frame");
         assert_eq!(dim.len(), 1);
         assert_eq!(
@@ -1430,9 +1633,46 @@ mod tests {
         );
 
         let bright = flash
-            .frame_if_due(start + Duration::from_millis(1_000), &config, &engine)
+            .frame_if_due_for_mode(
+                start + Duration::from_millis(1_000),
+                LightingMode::Day,
+                &config,
+                &engine,
+            )
             .expect("bright frame");
         assert_eq!(bright[0].color, config.colors.approval);
+    }
+
+    #[test]
+    fn night_mode_never_emits_a_flash_frame() {
+        let config = AppConfig::default();
+        let mut engine = Engine::new(config.behavior.max_sessions);
+        engine.transition("task", StateKind::Working, 10, &config);
+        let start = Instant::now();
+        let mut flash = FlashController::new_at(start);
+
+        assert!(
+            flash
+                .frame_if_due_for_mode(
+                    start + Duration::from_secs(5),
+                    LightingMode::Night,
+                    &config,
+                    &engine,
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lighting_mode_controller_changes_only_when_a_schedule_boundary_is_crossed() {
+        let config = AppConfig::default();
+        let mut controller = LightingModeController::new_at_minute(&config, 16 * 60 + 59);
+
+        assert_eq!(controller.mode(), LightingMode::Day);
+        assert!(!controller.update_at_minute(&config, 16 * 60 + 59));
+        assert!(controller.update_at_minute(&config, 17 * 60));
+        assert_eq!(controller.mode(), LightingMode::Night);
+        assert!(!controller.update_at_minute(&config, 17 * 60 + 1));
     }
 
     #[test]
