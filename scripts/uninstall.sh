@@ -51,7 +51,13 @@ if [[ -f "$HOOKS_FILE" ]]; then
     install -m 0600 "$TEMP_DIR/hooks.json" "$HOOKS_FILE"
 fi
 
-rm -f "$LAUNCH_AGENT" "$BINARY" "$LOG_FILE"
+rm -f \
+    "$LAUNCH_AGENT" \
+    "$BINARY" \
+    "$LOG_FILE" \
+    "$LOG_FILE.1" \
+    "$LOG_FILE.2" \
+    "$LOG_FILE.rotate.tmp"
 rm -rf "$RUNTIME_DIR"
 
 if [[ "${1:-}" == "--purge" ]]; then

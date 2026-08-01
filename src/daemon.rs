@@ -25,6 +25,9 @@ const STATUS_WRITE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_LOOP_DELAY_THRESHOLD: Duration = Duration::from_millis(250);
 const EVENT_LOOP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const LIGHTING_MODE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_ROTATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const LOG_ROTATION_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_ROTATION_RETAINED_FILES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusWriteRequest {
@@ -35,6 +38,38 @@ enum StatusWriteRequest {
 
 struct StatusPersistence {
     deadline: Option<Instant>,
+}
+
+struct LogRotator {
+    last_checked: Instant,
+    max_bytes: u64,
+    retained_files: usize,
+}
+
+impl LogRotator {
+    fn new() -> Self {
+        Self::new_at(
+            Instant::now(),
+            LOG_ROTATION_MAX_BYTES,
+            LOG_ROTATION_RETAINED_FILES,
+        )
+    }
+
+    fn new_at(now: Instant, max_bytes: u64, retained_files: usize) -> Self {
+        Self {
+            last_checked: now,
+            max_bytes,
+            retained_files,
+        }
+    }
+
+    fn rotate_if_due(&mut self, now: Instant, path: &Path) -> Result<Option<bool>> {
+        if now.saturating_duration_since(self.last_checked) < LOG_ROTATION_CHECK_INTERVAL {
+            return Ok(None);
+        }
+        self.last_checked = now;
+        rotate_log_file(path, self.max_bytes, self.retained_files).map(Some)
+    }
 }
 
 impl StatusPersistence {
@@ -402,6 +437,7 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut lifecycle = LifecycleTracker::default();
     let mut flash = FlashController::new();
     let mut lighting_watchdog = LightingWatchdog::new();
+    let mut log_rotator = LogRotator::new();
     let mut hardware = Hardware::new();
     let mut status_publisher = StatusPublisher::new();
     log_event(
@@ -600,6 +636,17 @@ pub fn run(paths: Paths) -> Result<()> {
         {
             status_publisher.publish(&paths, &config, &engine, &hardware, &journals);
             status_persistence.mark_flushed();
+        }
+
+        match log_rotator.rotate_if_due(Instant::now(), &paths.log) {
+            Ok(Some(true)) => log_event(
+                "log-rotated",
+                &format!(
+                    "max_bytes={LOG_ROTATION_MAX_BYTES} retained_files={LOG_ROTATION_RETAINED_FILES}"
+                ),
+            ),
+            Ok(Some(false) | None) => {}
+            Err(error) => log_event("log-rotation-failed", &format!("{error:#}")),
         }
 
         if status_persistence.take_if_due(Instant::now()) {
@@ -1355,10 +1402,76 @@ fn log_event(event: &str, message: &str) {
     eprintln!("ts={} event={event} message={message:?}", epoch_seconds());
 }
 
+fn log_path_with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(suffix);
+    suffixed.into()
+}
+
+fn rotate_log_file(path: &Path, max_bytes: u64, retained_files: usize) -> Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.len() < max_bytes {
+        return Ok(false);
+    }
+
+    if retained_files > 0 {
+        let oldest = log_path_with_suffix(path, &format!(".{retained_files}"));
+        if oldest.exists() {
+            fs::remove_file(&oldest)
+                .with_context(|| format!("failed to remove {}", oldest.display()))?;
+        }
+        for index in (1..retained_files).rev() {
+            let source = log_path_with_suffix(path, &format!(".{index}"));
+            if !source.exists() {
+                continue;
+            }
+            let destination = log_path_with_suffix(path, &format!(".{}", index + 1));
+            fs::rename(&source, &destination).with_context(|| {
+                format!(
+                    "failed to move {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+
+        let temporary = log_path_with_suffix(path, ".rotate.tmp");
+        if temporary.exists() {
+            fs::remove_file(&temporary)
+                .with_context(|| format!("failed to remove {}", temporary.display()))?;
+        }
+        fs::copy(path, &temporary)
+            .with_context(|| format!("failed to archive {}", path.display()))?;
+        let first_archive = log_path_with_suffix(path, ".1");
+        fs::rename(&temporary, &first_archive).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                temporary.display(),
+                first_archive.display()
+            )
+        })?;
+    }
+
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {} for truncation", path.display()))?
+        .set_len(0)
+        .with_context(|| format!("failed to truncate {}", path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::os::unix::net::UnixDatagram;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1369,8 +1482,9 @@ mod tests {
 
     use super::{
         EventLoopHealth, FlashController, Hardware, LightingModeController, LightingWatchdog,
-        StatusPersistence, StatusPublisher, StatusWriteRequest, clear_removed_journal_sessions,
-        prune_unadmitted_sessions, remove_stale_socket, restore_engine, write_status,
+        LogRotator, StatusPersistence, StatusPublisher, StatusWriteRequest,
+        clear_removed_journal_sessions, prune_unadmitted_sessions, remove_stale_socket,
+        restore_engine, rotate_log_file, write_status,
     };
 
     fn temporary_root(label: &str) -> std::path::PathBuf {
@@ -1382,6 +1496,85 @@ mod tests {
             "cai-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn rotates_a_launchd_log_without_breaking_its_open_append_handle() {
+        let root = temporary_root("rotate-log");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("codex-agent-indicator.log");
+        let first_archive = log.with_extension("log.1");
+        let second_archive = log.with_extension("log.2");
+        let mut launchd_handle = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+
+        launchd_handle.write_all(b"first-generation\n").unwrap();
+        launchd_handle.flush().unwrap();
+        assert!(rotate_log_file(&log, 8, 2).unwrap());
+        assert_eq!(fs::read(&first_archive).unwrap(), b"first-generation\n");
+        assert_eq!(fs::read(&log).unwrap(), b"");
+
+        launchd_handle.write_all(b"second-generation\n").unwrap();
+        launchd_handle.flush().unwrap();
+        assert!(rotate_log_file(&log, 8, 2).unwrap());
+        assert_eq!(fs::read(&first_archive).unwrap(), b"second-generation\n");
+        assert_eq!(fs::read(&second_archive).unwrap(), b"first-generation\n");
+
+        launchd_handle.write_all(b"still-live\n").unwrap();
+        launchd_handle.flush().unwrap();
+        assert_eq!(fs::read(&log).unwrap(), b"still-live\n");
+
+        assert!(rotate_log_file(&log, 8, 2).unwrap());
+        assert_eq!(fs::read(&first_archive).unwrap(), b"still-live\n");
+        assert_eq!(fs::read(&second_archive).unwrap(), b"second-generation\n");
+        assert!(!log.with_extension("log.3").exists());
+
+        launchd_handle.write_all(b"after-third-rotation\n").unwrap();
+        launchd_handle.flush().unwrap();
+        assert_eq!(fs::read(&log).unwrap(), b"after-third-rotation\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn leaves_a_log_below_the_rotation_limit_untouched() {
+        let root = temporary_root("small-log");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("codex-agent-indicator.log");
+        fs::write(&log, b"small\n").unwrap();
+
+        assert!(!rotate_log_file(&log, 1024, 2).unwrap());
+        assert_eq!(fs::read(&log).unwrap(), b"small\n");
+        assert!(!log.with_extension("log.1").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checks_log_size_only_when_the_rotation_interval_is_due() {
+        let root = temporary_root("rotation-interval");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("codex-agent-indicator.log");
+        fs::write(&log, b"large-enough\n").unwrap();
+        let started = Instant::now();
+        let mut rotator = LogRotator::new_at(started, 8, 2);
+
+        assert_eq!(
+            rotator
+                .rotate_if_due(started + Duration::from_secs(59), &log)
+                .unwrap(),
+            None
+        );
+        assert!(!log.with_extension("log.1").exists());
+        assert_eq!(
+            rotator
+                .rotate_if_due(started + Duration::from_secs(60), &log)
+                .unwrap(),
+            Some(true)
+        );
+        assert!(log.with_extension("log.1").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1496,6 +1689,7 @@ mod tests {
         let paths = Paths {
             config: root.join("config.toml"),
             codex_sessions: root.join("sessions"),
+            log: root.join("codex-agent-indicator.log"),
             runtime_dir: root.clone(),
             socket: root.join("indicator.sock"),
             status: root.join("status.json"),
@@ -1534,6 +1728,7 @@ mod tests {
         let paths = Paths {
             config: root.join("config.toml"),
             codex_sessions: root.join("sessions"),
+            log: root.join("codex-agent-indicator.log"),
             runtime_dir: root.clone(),
             socket: root.join("indicator.sock"),
             status: root.join("status.json"),
@@ -1785,6 +1980,7 @@ mod tests {
         let mut paths = Paths {
             config: root.join("config.toml"),
             codex_sessions: root.join("sessions"),
+            log: root.join("codex-agent-indicator.log"),
             runtime_dir: root.clone(),
             socket: root.join("indicator.sock"),
             status: blocker.join("status.json"),
