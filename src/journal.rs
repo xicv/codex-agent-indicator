@@ -48,6 +48,7 @@ pub struct JournalReader {
     skip_partial_line: bool,
     active_turn: Option<String>,
     completed_turn: Option<String>,
+    pending_tool_calls: HashSet<String>,
 }
 
 pub struct JournalTracker {
@@ -87,13 +88,24 @@ struct JournalRecord {
 struct JournalPayload {
     #[serde(rename = "type")]
     event_type: String,
-    turn_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    internal_chat_message_metadata_passthrough: JournalMessageMetadata,
     #[serde(default)]
     started_at: Option<u64>,
     #[serde(default)]
     completed_at: Option<u64>,
     #[serde(default)]
     last_agent_message: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct JournalMessageMetadata {
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 impl JournalReader {
@@ -118,18 +130,27 @@ impl JournalReader {
             skip_partial_line,
             active_turn: None,
             completed_turn: None,
+            pending_tool_calls: HashSet::new(),
         };
         let latest = reader.poll(config)?;
         Ok((reader, latest))
     }
 
     pub fn poll(&mut self, config: &AppConfig) -> Result<Option<JournalTransition>> {
-        let length = self.file.metadata()?.len();
+        let metadata = self.file.metadata()?;
+        let length = metadata.len();
+        let journal_modified_at = metadata
+            .modified()
+            .unwrap_or_else(|_| SystemTime::now())
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         if length < self.offset {
             self.offset = 0;
             self.skip_partial_line = false;
             self.active_turn = None;
             self.completed_turn = None;
+            self.pending_tool_calls.clear();
         }
         if length == self.offset {
             return Ok(None);
@@ -163,12 +184,16 @@ impl JournalReader {
             }
             let record: JournalRecord = serde_json::from_slice(&line)
                 .context("invalid Codex lifecycle journal record")?;
-            if let Some(transition) = self.observe(record, config) {
+            if let Some(transition) = self.observe(record, config, journal_modified_at) {
                 latest = Some(transition);
             }
         }
 
-        Ok(latest)
+        if self.pending_tool_calls.is_empty() {
+            Ok(latest)
+        } else {
+            Ok(None)
+        }
     }
 
     fn follow(path: &Path) -> Result<Self> {
@@ -182,6 +207,7 @@ impl JournalReader {
             skip_partial_line: false,
             active_turn: None,
             completed_turn: None,
+            pending_tool_calls: HashSet::new(),
         })
     }
 
@@ -189,18 +215,41 @@ impl JournalReader {
         &mut self,
         record: JournalRecord,
         config: &AppConfig,
+        journal_modified_at: u64,
     ) -> Option<JournalTransition> {
+        if record.record_type == "response_item" {
+            let call_id = correlated_tool_call_id(&record.payload)?;
+            return match record.payload.event_type.as_str() {
+                "custom_tool_call" | "function_call" => {
+                    self.pending_tool_calls.insert(call_id);
+                    None
+                }
+                "custom_tool_call_output" | "function_call_output" => {
+                    self.pending_tool_calls.remove(&call_id);
+                    self.pending_tool_calls
+                        .is_empty()
+                        .then_some(JournalTransition {
+                            state: config.events.post_tool_success,
+                            occurred_at: journal_modified_at,
+                        })
+                }
+                _ => None,
+            };
+        }
+
         if record.record_type != "event_msg" {
             return None;
         }
 
+        let turn_id = record.payload.turn_id?;
         match record.payload.event_type.as_str() {
             "task_started" => {
-                if self.completed_turn.as_deref() == Some(record.payload.turn_id.as_str()) {
+                if self.completed_turn.as_deref() == Some(turn_id.as_str()) {
                     return None;
                 }
-                self.active_turn = Some(record.payload.turn_id);
+                self.active_turn = Some(turn_id);
                 self.completed_turn = None;
+                self.pending_tool_calls.clear();
                 Some(JournalTransition {
                     state: config.events.user_prompt_submit,
                     occurred_at: record.payload.started_at?,
@@ -208,7 +257,7 @@ impl JournalReader {
             }
             "task_complete"
                 if self.active_turn.as_deref().is_none()
-                    || self.active_turn.as_deref() == Some(record.payload.turn_id.as_str()) =>
+                    || self.active_turn.as_deref() == Some(turn_id.as_str()) =>
             {
                 let last_message = record
                     .payload
@@ -216,7 +265,8 @@ impl JournalReader {
                     .as_deref()
                     .map(message_tail);
                 self.active_turn = None;
-                self.completed_turn = Some(record.payload.turn_id);
+                self.completed_turn = Some(turn_id);
+                self.pending_tool_calls.clear();
                 Some(JournalTransition {
                     state: state_for_hook(
                         "Stop",
@@ -231,6 +281,19 @@ impl JournalReader {
             _ => None,
         }
     }
+}
+
+fn correlated_tool_call_id(payload: &JournalPayload) -> Option<String> {
+    let call_id = payload.call_id.as_deref()?.trim();
+    let turn_id = payload
+        .internal_chat_message_metadata_passthrough
+        .turn_id
+        .as_deref()?
+        .trim();
+    if call_id.is_empty() || turn_id.is_empty() {
+        return None;
+    }
+    Some(call_id.to_owned())
 }
 
 impl JournalTracker {
@@ -563,9 +626,19 @@ fn is_lifecycle_candidate(line: &[u8]) -> bool {
     let header = &line[..payload_start];
     let payload_end = line.len().min(payload_start + 256);
     let payload_prefix = &line[payload_start..payload_end];
-    contains_bytes(header, br#""type":"event_msg""#)
+    let lifecycle_event = contains_bytes(header, br#""type":"event_msg""#)
         && (contains_bytes(payload_prefix, br#""type":"task_started""#)
-            || contains_bytes(payload_prefix, br#""type":"task_complete""#))
+            || contains_bytes(payload_prefix, br#""type":"task_complete""#));
+    let tool_lifecycle = contains_bytes(header, br#""type":"response_item""#)
+        && [
+            br#""type":"custom_tool_call""#.as_slice(),
+            br#""type":"custom_tool_call_output""#.as_slice(),
+            br#""type":"function_call""#.as_slice(),
+            br#""type":"function_call_output""#.as_slice(),
+        ]
+        .into_iter()
+        .any(|event_type| contains_bytes(payload_prefix, event_type));
+    lifecycle_event || tool_lifecycle
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -595,6 +668,9 @@ mod tests {
 
     const LIFECYCLE: &str =
         include_str!("journal/fixtures/codex-app-0.146.0-alpha.3.1/lifecycle.jsonl");
+    const APPROVAL_RESUME: &str = include_str!(
+        "journal/fixtures/codex-app-0.146.0-alpha.9.2/approval-resume.jsonl"
+    );
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
@@ -631,6 +707,84 @@ mod tests {
     }
 
     #[test]
+    fn completed_tool_output_repairs_a_missed_approval_resume_on_startup() {
+        let path = temporary_journal(APPROVAL_RESUME);
+        let config = AppConfig::default();
+
+        let (_, latest) = JournalReader::recover(&path, &config).unwrap();
+
+        assert_eq!(latest.unwrap().state, StateKind::Working);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn appended_tool_output_repairs_a_missed_approval_resume_once() {
+        let (pending_call, completed_calls) = APPROVAL_RESUME
+            .split_once('\n')
+            .expect("fixture contains a pending call and its completion");
+        let path = temporary_journal(&format!("{pending_call}\n"));
+        let config = AppConfig::default();
+        let (mut reader, latest) = JournalReader::recover(&path, &config).unwrap();
+        assert!(latest.is_none());
+
+        append(&path, completed_calls);
+        let transition = reader.poll(&config).unwrap().unwrap();
+
+        assert_eq!(transition.state, StateKind::Working);
+        assert!(reader.poll(&config).unwrap().is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pending_tool_call_does_not_clear_a_real_approval() {
+        let pending_call = APPROVAL_RESUME
+            .lines()
+            .next()
+            .expect("fixture begins with the approval-gated call");
+        let path = temporary_journal(&format!("{pending_call}\n"));
+        let config = AppConfig::default();
+
+        let (_, latest) = JournalReader::recover(&path, &config).unwrap();
+
+        assert!(latest.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn one_completed_call_does_not_clear_another_pending_approval() {
+        let records = APPROVAL_RESUME.lines().collect::<Vec<_>>();
+        let path = temporary_journal(&format!("{}\n{}\n", records[0], records[2]));
+        let config = AppConfig::default();
+        let (mut reader, latest) = JournalReader::recover(&path, &config).unwrap();
+        assert!(latest.is_none());
+
+        append(&path, &format!("{}\n", records[1]));
+        assert!(reader.poll(&config).unwrap().is_none());
+
+        append(&path, &format!("{}\n", records[3]));
+        assert_eq!(
+            reader.poll(&config).unwrap().unwrap().state,
+            StateKind::Working
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn newer_pending_call_suppresses_an_older_resume_during_recovery() {
+        let records = APPROVAL_RESUME.lines().collect::<Vec<_>>();
+        let path = temporary_journal(&format!(
+            "{}\n{}\n{}\n",
+            records[0], records[1], records[2]
+        ));
+        let config = AppConfig::default();
+
+        let (_, latest) = JournalReader::recover(&path, &config).unwrap();
+
+        assert!(latest.is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn incomplete_jsonl_record_waits_for_its_newline_before_reconciliation() {
         let path = temporary_journal(LIFECYCLE);
         let config = AppConfig::default();
@@ -656,8 +810,10 @@ mod tests {
 
     #[test]
     fn native_fixture_is_privacy_scrubbed() {
-        for forbidden in ["/Users/", "/home/", "file://", "github_pat_", "PRIVATE KEY"] {
-            assert!(!LIFECYCLE.contains(forbidden));
+        for fixture in [LIFECYCLE, APPROVAL_RESUME] {
+            for forbidden in ["/Users/", "/home/", "file://", "github_pat_", "PRIVATE KEY"] {
+                assert!(!fixture.contains(forbidden));
+            }
         }
     }
 

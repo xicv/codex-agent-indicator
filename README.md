@@ -55,7 +55,7 @@ brew install jq
 Install the published command-line binary:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.13 --locked
+cargo install codex-agent-indicator --version 0.4.14 --locked
 ```
 
 Cargo installs the command in `~/.cargo/bin`. This gives you the CLI, but it
@@ -76,7 +76,7 @@ setup below.
 To reinstall a specific version instead:
 
 ```sh
-cargo install codex-agent-indicator --version 0.4.13 --locked --force
+cargo install codex-agent-indicator --version 0.4.14 --locked --force
 ```
 
 ### Complete keyboard-monitor setup
@@ -228,8 +228,10 @@ error = "#ff3b30"
 - Child activity within an admitted desktop task can update its parent light,
   but never receives a separate G-key.
 - Fast hooks are reconciled against the known task's local `task_started` and
-  `task_complete` journal records. A missed terminal hook therefore corrects
-  itself within about 250 ms instead of leaving a stale blue key.
+  `task_complete` journal records and correlated local tool-call completions.
+  A missed terminal or post-approval hook therefore corrects itself within
+  about 250 ms instead of leaving a stale blue or amber key. An unresolved
+  tool call remains amber, including when another concurrent call completes.
 - Permission and user-input states take priority over unrelated subagent
   activity.
 - A failed individual tool remains blue while Codex handles it; red is reserved
@@ -296,6 +298,9 @@ Common causes:
 - A terminal `task_complete` record repairs a missed `Stop` hook. An app-level
   failure that writes neither record can still leave the last blue state; use
   `codex-agent-indicator set error TASK_ID` to correct that rare case manually.
+- A completed, turn-correlated local tool output repairs a missed post-approval
+  hook. The indicator does not infer approval merely from navigation or from an
+  unrelated tool output, so a genuinely pending request remains amber.
 - The daemon log is stored at
   `~/Library/Logs/codex-agent-indicator.log`. Hardware and persistence recovery
   events include Unix timestamps. `event-loop-delay` identifies CPU scheduling
@@ -320,8 +325,9 @@ Common causes:
   checks only for appended bytes every 250 ms.
 - The active day/night schedule is checked at most once per second and only
   repaints when the selected mode changes.
-- It ignores non-lifecycle journal records and never stores journal content in
-  its status file or logs.
+- It ignores unrelated journal records and never stores journal content in its
+  status file or logs. Tool reconciliation retains only in-memory call IDs for
+  the currently followed tasks.
 - The daemon does not poll Codex databases or processes and does not start a
   second app-server.
 - The LaunchAgent uses macOS's interactive scheduling class because it handles
@@ -347,10 +353,11 @@ Hooks send a small Unix datagram and exit. The daemon verifies the task's
 persisted Codex Desktop origin, tracks task, turn, and child-agent identity,
 batches lighting changes into one HID++ frame, debounces unchanged status-file
 writes, restores only valid app tasks after restarts, and sleeps between events.
-A bounded local-journal adapter reconciles native turn start and completion
-records when a hook is missed. A low-rate watchdog reclaims Logitech
-direct-lighting mode. G-key presses use Logitech's HID++ `0x8010` feature. Task
-switching uses Codex's `codex://threads/<thread-id>` deep link.
+A bounded local-journal adapter reconciles native turn start, turn completion,
+and correlated local tool completion records when a hook is missed. A low-rate
+watchdog reclaims Logitech direct-lighting mode. G-key presses use Logitech's
+HID++ `0x8010` feature. Task switching uses Codex's
+`codex://threads/<thread-id>` deep link.
 
 Only live RGB output and G-key notification diversion are controlled while the
 daemon runs. The program does not edit G HUB macros, profiles, key assignments,
@@ -367,9 +374,11 @@ cargo clippy --all-targets -- -D warnings
 Lifecycle replay tests use privacy-scrubbed, version-labelled Codex hook JSON
 and the matching official input schemas. A separate pinned Codex app fixture
 exercises origin admission and native `task_started`/`task_complete`
-reconciliation, including rejected CLI/other-app sessions, missing journals, a
-missed `Stop`, and a newer active turn. Together they exercise the complete
-adapter → lifecycle tracker → G-key slot path:
+reconciliation. A second pinned fixture covers approval-resume tool output,
+including concurrent and newer pending calls. The fixtures also cover rejected
+CLI/other-app sessions, missing journals, a missed `Stop`, and a newer active
+turn. Together they exercise the complete adapter → lifecycle tracker → G-key
+slot path:
 
 ```sh
 cargo test wire::replay_tests
